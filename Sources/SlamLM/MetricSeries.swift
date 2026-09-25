@@ -622,15 +622,32 @@ struct PaperButton: View {
                 }
                 Text(title).font(.system(size: 11, weight: .semibold))
             }
-            .foregroundStyle(style == .primary ? Paper.accentInk : Paper.ink.opacity(0.8))
+            // A disabled control still has to say what it is: fading the whole
+            // button to 34% turned the primary style into a blank grey pill, so
+            // the muted state moves into the colours instead.
+            .foregroundStyle(ink)
             .padding(.horizontal, 11)
             .padding(.vertical, 6)
-            .background(Capsule().fill(style == .primary ? Paper.accent : Paper.card))
-            .overlay(Capsule().strokeBorder(style == .primary ? .clear : Paper.stroke, lineWidth: 1))
-            .opacity(enabled ? 1 : 0.34)
+            .background(Capsule().fill(fill))
+            .overlay(Capsule().strokeBorder(stroke, lineWidth: 1))
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
+    }
+
+    private var fill: Color {
+        guard enabled else { return Paper.cardSunken }
+        return style == .primary ? Paper.accent : Paper.card
+    }
+
+    private var ink: Color {
+        guard enabled else { return Paper.inkFaint }
+        return style == .primary ? Paper.accentInk : Paper.ink.opacity(0.8)
+    }
+
+    private var stroke: Color {
+        guard enabled else { return Paper.hairline }
+        return style == .primary ? .clear : Paper.stroke
     }
 }
 
