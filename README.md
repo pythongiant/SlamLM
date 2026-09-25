@@ -12,9 +12,9 @@ first token, where the step time went, and what the machine is really using.
 ![python](https://img.shields.io/badge/python-3.10%2B%20%C2%B7%20stdlib%20bridge-3776AB?style=flat-square)
 ![mlx](https://img.shields.io/badge/runs%20on-MLX%20%C2%B7%20mlx--lm-6F7F53?style=flat-square)
 
-<img src="docs/picker.png" width="392" alt="SlamLM menu bar panel: model list with a model running, category filters, and live memory in the footer">
+<img src="docs/desktop.png" width="450" alt="SlamLM's brain icon in the macOS menu bar, with its panel open over the desktop">
 
-<sub>The panel is the whole app. Here it is with Qwen3 1.7B loaded and serving.</sub>
+<sub>The menu bar item and the panel it opens — there is nothing else to launch.</sub>
 
 </div>
 
@@ -69,6 +69,11 @@ behind a disclosure, so the answer is the thing you read.
 - **Chat templating** — prompts go through the model's own chat template, the same path
   the HTTP endpoint uses.
 - **Keyboard and VoiceOver friendly** — every control is labelled; `⌘K` focuses search.
+
+<div align="center">
+<img src="docs/picker.png" width="392" alt="The picker with Qwen3 1.7B loaded and serving: the row reads Running, the footer shows the endpoint and system memory">
+<sub>A model running: the row reads <i>Running</i>, and the footer carries the endpoint and the machine's memory.</sub>
+</div>
 
 ## Requirements
 
