@@ -118,11 +118,18 @@ request is handed back to the model as an error it can react to, never swallowed
 **What leaves the machine:** a `web_search` query, and nothing else — the model
 itself is local. Turn the switch off and there is no network access at all.
 
-Search is keyless: the bridge tries DuckDuckGo's HTML endpoint, its lite endpoint
-and Brave, in that order, and names which one answered. If every provider refuses —
-search engines rate-limit by IP, and a session of heavy use will hit that — the tool
-reports each refusal verbatim and hands that back to the model, rather than returning
-nothing and letting it invent an answer.
+Search is keyless — there is no API key to obtain or manage. The bridge tries
+DuckDuckGo's HTML endpoint, its lite endpoint, Brave, and Wikipedia, in that order,
+retrying a provider that is merely throttling rather than moving on at its first
+refusal, and naming which one answered. Wikipedia is last because it answers factual
+lookups rather than general queries, and it is the one that keeps working when a
+burst of searches has the engines handing out challenges.
+
+If every provider refuses, the tool reports each refusal verbatim — *and* tells the
+model plainly that no search was available, so it says the lookup failed instead of
+answering from its own memory. That matters: asked for a fact it could not look up, a
+small model states a confident wrong answer otherwise. The web tool is best-effort by
+nature; if you need dependable search, that is what a provider API key is for.
 
 ## Requirements
 

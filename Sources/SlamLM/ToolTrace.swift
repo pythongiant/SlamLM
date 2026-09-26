@@ -82,7 +82,9 @@ struct ToolTrace: View {
                     Text(detail)
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(Paper.inkSoft)
-                        .lineLimit(3)
+                        // A failure explains itself in one line per provider; cutting
+                        // it off hides the reason the call did not work.
+                        .lineLimit(entry.result?.ok == false ? 8 : 3)
                         .truncationMode(.tail)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
