@@ -50,12 +50,16 @@ continue. Without `chat` (or with any falsey value) the prompt is generated
 verbatim, which is what prefill/throughput measurement wants. A model whose
 tokenizer has no chat template falls back to the message content unchanged.
 
-`max_tokens` is optional and there is no user-facing token budget: a request
-without it generates until the model stops on its own, and the only ceiling is the
-model's context window (its `max_position_embeddings` minus the prompt, or 4096
-when the config does not say). A caller that passes `max_tokens` gets exactly that
-budget — the HTTP API honours the OpenAI field, and `--tokens` uses it to keep a
-documentation capture short.
+`max_tokens` is optional and there is no user-facing token budget: a request without
+it generates until the model stops on its own. There is still a ceiling, and it is a
+safety net rather than a knob: **2048 tokens per generation round**, never more than
+the model's own context window. It exists because a model that never emits its stop
+token would otherwise generate until the context window filled — minutes of work and a
+multi-gigabyte KV cache, which on a 16 GB machine pushes the host into swap and takes
+the panel down with it. `SLAM_LM_MAX_TOKENS` overrides the ceiling for anyone who
+wants a different one. A caller that passes `max_tokens` gets exactly that budget: the
+HTTP API honours the OpenAI field, and `--tokens` keeps a documentation capture short.
+A round stopped by either limit reports `finishReason: "length"`.
 
 `generate` with `tools: true` lets the model call the read-only tools below before
 it answers. The loop is bounded: at most `TOOL_ROUNDS` (4) rounds of

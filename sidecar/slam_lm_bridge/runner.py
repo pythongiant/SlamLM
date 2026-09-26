@@ -41,6 +41,14 @@ from .tools import (
 #: model's own config does not say.
 DEFAULT_CONTEXT_WINDOW = 4096
 
+#: Token ceiling for a request that did not ask for one. This is not a budget a
+#: person sets — a normal answer is far shorter — it exists because a model that
+#: never emits its stop token would otherwise generate until the context window
+#: is full: on a 16 GB machine that is minutes of generation and a multi-gigabyte
+#: KV cache, which pushes the host into swap and takes the panel down with it.
+#: `$SLAM_LM_MAX_TOKENS` overrides it; the context window is still the hard cap.
+DEFAULT_GENERATION_CEILING = 2048
+
 #: Prompt used for the post-load warmup: it exercises the real prefill path so
 #: the first user prompt pays no one-off compile cost (mlx-lm's own `generate`
 #: does the same with a real prompt).
@@ -114,8 +122,8 @@ class _Job:
 class _GenerateRequest:
     request: int
     prompt: str
-    #: `None` means no limit: PROTOCOL.md's ceiling is then the model's context
-    #: window, not a budget the bridge invents.
+    #: `None` means the caller asked for no budget: `_round_budget` then applies
+    #: the safety ceiling rather than a number the panel invented.
     max_tokens: Optional[int]
     cancel_seq: int
     submitted_perf: float
@@ -577,11 +585,31 @@ class Runner:
 
     # MARK: - Worker-thread generation
 
+    def _round_budget(self, requested: Optional[int]) -> int:
+        """How many tokens one generation round may produce.
+
+        An explicit `max_tokens` is honoured as given. Otherwise the default
+        ceiling applies, and never more than the model's own context window, so
+        even a silly `$SLAM_LM_MAX_TOKENS` cannot ask for more than fits.
+        """
+        if requested is not None:
+            return requested
+        configured = os.environ.get("SLAM_LM_MAX_TOKENS")
+        ceiling = DEFAULT_GENERATION_CEILING
+        if configured:
+            try:
+                value = int(configured)
+                if value > 0:
+                    ceiling = value
+            except ValueError:
+                pass
+        return max(1, min(ceiling, self._context_window()))
+
     def _context_window(self) -> int:
         """The loaded model's context length, from its own config.
 
-        PROTOCOL.md's ceiling for an unlimited request: the model's
-        `max_position_embeddings` when the config says, 4096 when it does not.
+        The hard cap on a round: the model's `max_position_embeddings` when the
+        config says, 4096 when it does not.
         """
         for source in (
             getattr(self._model, "args", None),
@@ -617,8 +645,8 @@ class Runner:
         buffered so a round that turns out to be tool scaffolding is never
         streamed as answer text.
 
-        An unlimited pass (`max_tokens < 0`) stops at the model's context
-        window minus the prompt, so `-1` can never spin forever.
+        `max_tokens` is resolved by `_round_budget` before it gets here, so a
+        round is always bounded and cannot spin forever.
         """
         model, tokenizer = self._model, self._tokenizer
         _, stream_generate = _mlx_lm()
@@ -629,7 +657,6 @@ class Runner:
         finish_reason: Optional[str] = None
         error_message: Optional[str] = None
         generator: Any = None
-        ceiling: Optional[int] = None
 
         try:
             generator = stream_generate(model, tokenizer, prompt, max_tokens=max_tokens)
@@ -646,9 +673,6 @@ class Runner:
                     )
                     self._stats.note_ttft(progress.ttft_ms, sanitise_float(prefill_tps))
                     self._state("generating", "decode", None)
-                    if max_tokens < 0:
-                        # This round's own prompt, not the request's first one.
-                        ceiling = self._context_window() - int(response.prompt_tokens)
 
                 progress.last = now
                 progress.last_response = response
@@ -682,10 +706,6 @@ class Runner:
 
                 if self._cancelled(req.cancel_seq):
                     finish_reason = "cancel"
-                    break
-                if ceiling is not None and progress.gen_tokens >= max(1, ceiling):
-                    # The model's own window, not its choice: it ran out of room.
-                    finish_reason = "length"
                     break
             else:
                 raw = getattr(progress.last_response, "finish_reason", None)
@@ -795,9 +815,9 @@ class Runner:
             # Cancelled between submit and start: never touch the model.
             finish_reason = "cancel"
         else:
-            # No `max_tokens` means no limit: `-1` streams until the model
-            # stops, bounded by `_stream_round` at the context window.
-            budget = req.max_tokens if req.max_tokens is not None else -1
+            # No `max_tokens` means no *user* budget: the model generates
+            # until it stops, bounded only by `_round_budget`'s safety ceiling.
+            budget = self._round_budget(req.max_tokens)
             _, finish_reason, error_message, _ = self._stream_round(
                 req, progress, req.prompt, budget, emit=True
             )
@@ -826,7 +846,7 @@ class Runner:
         # tool definitions into the system turn itself. The written
         # instructions are `_render_tools_prompt`'s fallback.
         messages: List[Dict[str, Any]] = [{"role": "user", "content": req.prompt}]
-        budget = req.max_tokens if req.max_tokens is not None else -1
+        budget = self._round_budget(req.max_tokens)
         finish_reason: Optional[str] = None
         error_message: Optional[str] = None
 

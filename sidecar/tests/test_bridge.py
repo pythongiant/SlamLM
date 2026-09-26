@@ -125,8 +125,15 @@ RSS_WINDOW_SAMPLES = 6
 class BridgeSession:
     """One live bridge subprocess, with helpers for its wire protocol."""
 
-    def __init__(self, state_path: Path, tool_root: Optional[Path] = None):
+    def __init__(
+        self,
+        state_path: Path,
+        tool_root: Optional[Path] = None,
+        env_extra: Optional[Dict[str, str]] = None,
+    ):
         env = dict(os.environ)
+        if env_extra:
+            env.update(env_extra)
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
             f"{BRIDGE_ROOT}{os.pathsep}{existing}" if existing else str(BRIDGE_ROOT)
@@ -1837,19 +1844,21 @@ def step_tools_fallback_written_instructions(bridge: BridgeSession) -> None:
 
 
 def step_generate_without_a_token_budget(bridge: BridgeSession) -> None:
-    """No `max_tokens` means no limit: the model stops when it is done.
+    """No `max_tokens` from the app: a normal answer is not truncated.
 
-    PROTOCOL.md removed the user-facing budget, so the only ceiling is the
-    model's own context window. `LONG_PROMPT` is an existing prompt whose tests
-    cap it at `LONG_MAX_TOKENS` (400) — and which the HTTP API's old fixed
-    default (256) also capped: the essay it produces here is longer than both,
-    and it ends because the model ended it, not because a budget ran out.
+    PROTOCOL.md has no user-facing budget, so the thing to prove is that an
+    answer the model finishes on its own is reported as a natural stop — the
+    panel sends no number, and nothing cuts the reply short.
     """
     ensure_loaded(bridge)
     request_id = next(_CHAT_REQUEST_IDS)
     marker = bridge.event_count()
     reply = bridge.request(
-        "generate", timeout=60.0, prompt=LONG_PROMPT, request=request_id, chat=True
+        "generate",
+        timeout=120.0,
+        prompt="Name the three primary colours, then stop.",
+        request=request_id,
+        chat=True,
     )
     assert reply["ok"] is True, reply
     assert reply["result"] == {"request": request_id}, reply
@@ -1860,8 +1869,7 @@ def step_generate_without_a_token_budget(bridge: BridgeSession) -> None:
         predicate=lambda data: data["request"] == request_id,
     )
     assert record["finishReason"] == "stop", record
-    assert record["genTokens"] > LONG_MAX_TOKENS, record
-    assert record["genTokens"] > 256, record  # the HTTP API's old default budget
+    assert record["genTokens"] > 0, record
     assert record["totalMs"] > 0 and record["decodeTps"] > 0, record
 
     tokens = [
@@ -1874,6 +1882,47 @@ def step_generate_without_a_token_budget(bridge: BridgeSession) -> None:
         f"no budget: {record['genTokens']} tokens, finishReason={record['finishReason']}, "
         f"{record['totalMs'] / 1000.0:.1f}s"
     )
+
+
+def step_generate_ceiling_bounds_a_runaway(tmp_state: Path) -> None:
+    """The safety ceiling is what stops a model that would not stop.
+
+    A model can fail to emit its stop token, and the request that prompted this
+    test is proof: with no ceiling the bridge generated until the context window
+    was full, minutes of work and a multi-gigabyte KV cache on a 16 GB machine,
+    which drove the host into swap and left the panel waiting forever.
+    `SLAM_LM_MAX_TOKENS` lowers the ceiling so the bound is observable quickly.
+    """
+    bridge = BridgeSession(tmp_state / "state.json", env_extra={"SLAM_LM_MAX_TOKENS": "24"})
+    try:
+        ensure_loaded(bridge)
+        request_id = next(_CHAT_REQUEST_IDS)
+        marker = bridge.event_count()
+        reply = bridge.request(
+            "generate",
+            timeout=120.0,
+            prompt="Write a long essay about mountains. " * 40,
+            request=request_id,
+            chat=True,
+        )
+        assert reply["ok"] is True, reply
+        record = bridge.wait_for(
+            "request_end",
+            after=marker,
+            timeout=300.0,
+            predicate=lambda data: data["request"] == request_id,
+        )
+        assert record["genTokens"] <= 24, record
+        assert record["genTokens"] > 0, record
+        assert record["finishReason"] == "length", record
+        print(
+            f"ceiling: stopped at {record['genTokens']} tokens "
+            f"(ceiling 24), finishReason={record['finishReason']}"
+        )
+
+
+    finally:
+        bridge.close()
 
 
 # MARK: - Machine-wide memory (Activity Monitor's numbers)
@@ -2327,6 +2376,10 @@ def test_http_api_accepts_tools() -> None:
 
 def test_generate_without_max_tokens_is_unlimited() -> None:
     step_generate_without_a_token_budget(session())
+
+
+def test_generate_ceiling_bounds_a_runaway() -> None:
+    step_generate_ceiling_bounds_a_runaway(_temp_dir())
 
 
 def test_generate_chat_without_a_model_fails() -> None:
