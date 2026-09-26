@@ -82,6 +82,8 @@ struct AnalyticsView: View {
             LastOutputCard(
                 text: metrics.streamText,
                 toolEvents: metrics.toolEvents,
+                generating: metrics.status == .generating,
+                progressTokens: max(0, (live?.tokensGenerated ?? 0) - metrics.requestStartTokens),
                 stoppedAtLimit: metrics.requests.first?.finishReason == "length"
             )
         }
@@ -753,6 +755,11 @@ private struct LastOutputCard: View {
     let text: String
     /// Tool calls and results for the request that produced this output.
     let toolEvents: [ToolEvent]
+    /// The model is generating right now, and its rounds are buffered, so the
+    /// card has to say that work is happening even though no text has arrived.
+    let generating: Bool
+    /// Tokens produced since this request started.
+    let progressTokens: Int
     /// The newest request stopped at a limit rather than finishing on its own.
     /// A model can spend an entire budget reasoning and produce no answer at
     /// all; saying so is the difference between "still working" and "it is not
@@ -772,7 +779,28 @@ private struct LastOutputCard: View {
                         TagPill(text: "\(text.count) chars")
                     }
                 }
-                if text.isEmpty {
+                if text.isEmpty && generating {
+                    // A tool-enabled run buffers every round, so nothing is
+                    // streamed until a round turns out to be the answer. Without
+                    // this the panel looks dead for the whole run and people
+                    // cancel a request that is working.
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(PaperFormat.tokens(progressTokens))
+                            .font(PaperFont.numeral(22))
+                            .monospacedDigit()
+                            .foregroundStyle(Paper.ink)
+                        Text("tokens so far")
+                            .font(PaperFont.meta)
+                            .foregroundStyle(Paper.inkSoft)
+                        Spacer(minLength: 4)
+                        StatusDot(color: Paper.olive, diameter: 6)
+                    }
+                    ToolTrace(events: toolEvents)
+                    Text("Working: a tool-enabled round is held back until it is known to be the answer, so the reply appears when the model finishes one. Tool calls show up here as they run.")
+                        .font(PaperFont.meta)
+                        .foregroundStyle(Paper.inkFaint)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if text.isEmpty {
                     EmptyState(symbol: "text.alignleft", title: "No output yet",
                                detail: "Tokens streamed for the most recent request appear here.")
                 } else {

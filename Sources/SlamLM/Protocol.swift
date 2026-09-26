@@ -289,6 +289,9 @@ final class MetricsBus: ObservableObject {
     /// Whether the model may call the read-only tools. Read by the store when it
     /// sends a prompt, so both surfaces agree on the setting.
     @Published var toolsEnabled = true
+    /// Session token counter when the newest request started, so the panel can
+    /// report that request's progress while it runs.
+    @Published var requestStartTokens = 0
 
     /// Append a telemetry sample, keeping the buffer bounded.
     func ingest(_ sample: LiveMetrics) {
@@ -325,6 +328,7 @@ final class MetricsBus: ObservableObject {
     func clearStream() {
         streamText = ""
         toolEvents = []
+        requestStartTokens = live?.tokensGenerated ?? 0
     }
 }
 
