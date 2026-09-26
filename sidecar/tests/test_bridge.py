@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import atexit
 import collections
+import dataclasses
 import http.client
 import itertools
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -74,8 +76,22 @@ CHAT_MAX_TOKENS = 4
 #: so their events can never be read as an older request's.
 CHAT_REQUEST_BASE = 9000
 _CHAT_REQUEST_IDS = itertools.count(CHAT_REQUEST_BASE)
+#: The tool loop's request ids, clear of every other scenario's.
+TOOL_REQUEST_BASE = 9500
+_TOOL_REQUEST_IDS = itertools.count(TOOL_REQUEST_BASE)
 REQUEST_ID = 7
 MEGABYTE = 1024 * 1024
+
+#: The tree the bridge's file tools are confined to ($SLAM_LM_TOOL_ROOT): a real
+#: temp directory holding a known file and a nested one, so `read_file`,
+#: `list_directory` and `search_files` are exercised offline and deterministically.
+TOOL_FILE_NAME = "note.txt"
+TOOL_FILE_TEXT = "The secret word is platypus.\n"
+TOOL_NESTED_DIR = "nested"
+TOOL_NESTED_NAME = "deep.txt"
+TOOL_NESTED_TEXT = "a nested file\n"
+#: A path that is always outside that tree.
+OUTSIDE_PATH = "/etc/hosts"
 
 #: PROTOCOL.md's canonical display order for the derived model categories.
 CANONICAL_CATEGORIES = (
@@ -109,14 +125,18 @@ RSS_WINDOW_SAMPLES = 6
 class BridgeSession:
     """One live bridge subprocess, with helpers for its wire protocol."""
 
-    def __init__(self, state_path: Path):
+    def __init__(self, state_path: Path, tool_root: Optional[Path] = None):
         env = dict(os.environ)
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
             f"{BRIDGE_ROOT}{os.pathsep}{existing}" if existing else str(BRIDGE_ROOT)
         )
         env["SLAM_LM_STATE"] = str(state_path)
+        # The file tools are confined to this tree, so every path the tests
+        # exercise is real, local and deterministic — /etc/hosts is outside it.
+        env["SLAM_LM_TOOL_ROOT"] = str(tool_root if tool_root is not None else tool_root_path())
         self.state_path = state_path
+        self.tool_root = Path(env["SLAM_LM_TOOL_ROOT"])
         self.proc = subprocess.Popen(
             [str(PYTHON), "-m", "slam_lm_bridge.server"],
             cwd=str(APP_ROOT),
@@ -312,11 +332,31 @@ _SESSION: Optional[BridgeSession] = None
 _TEMP_DIR: Optional[tempfile.TemporaryDirectory[str]] = None
 
 
-def session() -> BridgeSession:
-    global _SESSION, _TEMP_DIR
-    if _SESSION is None:
+def _temp_dir() -> Path:
+    """One disposable temp directory for the state file and the tool tree."""
+    global _TEMP_DIR
+    if _TEMP_DIR is None:
         _TEMP_DIR = tempfile.TemporaryDirectory(prefix="slam-lm-test-")
-        _SESSION = BridgeSession(Path(_TEMP_DIR.name) / "state.json")
+        atexit.register(_TEMP_DIR.cleanup)
+    return Path(_TEMP_DIR.name)
+
+
+def tool_root_path() -> Path:
+    """The real temp tree the bridge's file tools are confined to."""
+    root = _temp_dir() / "tools"
+    if not root.exists():
+        root.mkdir()
+        (root / TOOL_FILE_NAME).write_text(TOOL_FILE_TEXT, encoding="utf-8")
+        nested = root / TOOL_NESTED_DIR
+        nested.mkdir()
+        (nested / TOOL_NESTED_NAME).write_text(TOOL_NESTED_TEXT, encoding="utf-8")
+    return root
+
+
+def session() -> BridgeSession:
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = BridgeSession(_temp_dir() / "state.json")
         atexit.register(_SESSION.close)
     return _SESSION
 
@@ -1331,8 +1371,18 @@ def step_generate_chat_junk_values(bridge: BridgeSession) -> None:
 
 def step_generate_chat_without_a_model(bridge: BridgeSession) -> None:
     """`chat` does not bypass the missing-model contract."""
+    marker = bridge.event_count()
     bridge.request("unload")
-    assert bridge.metrics_after(bridge.event_count())["model"] is None
+    # The sampler runs at 5 Hz while the unload is still releasing memory, so a
+    # sample captured mid-unload can arrive after it finished. Take the first
+    # sample that reports the unloaded state, not whichever lands next.
+    after = bridge.wait_for(
+        "metrics",
+        after=marker,
+        timeout=10.0,
+        predicate=lambda data: data["model"] is None,
+    )
+    assert after["status"] == "idle", after
 
     marker = bridge.event_count()
     request_id = next(_CHAT_REQUEST_IDS)
@@ -1355,6 +1405,475 @@ def step_generate_chat_without_a_model(bridge: BridgeSession) -> None:
         if entry["request"] == request_id
     ]
     assert ends == [], ends
+
+
+# MARK: - Tools
+
+#: Every tool round is given an explicit budget: the calls below are short, so
+#: this keeps each request bounded instead of letting a chatty model fill the
+#: context window. It is generous because a thinking model spends tokens on its
+#: reasoning before it emits the call (200-280 for these prompts, and the odd
+#: run reasons further than that).
+TOOL_MAX_TOKENS = 512
+
+#: How many times a forced call is asked for. The model is greedy, but MLX is
+#: not bit-deterministic, so the odd run reasons its way past the budget without
+#: emitting the call; asking again is what keeps these tests stable.
+TOOL_ATTEMPTS = 5
+#: A plain request that the model answers itself gets fewer retries: it either
+#: reaches for the tool or it does not, and that is the thing under test.
+TOOL_CALL_ATTEMPTS = 3
+
+#: PROTOCOL.md's exact keys for a `tool` event, in either phase.
+TOOL_EVENT_KEYS = {
+    "request",
+    "round",
+    "phase",
+    "name",
+    "arguments",
+    "ok",
+    "summary",
+    "detail",
+}
+
+
+def _tool_request(
+    bridge: BridgeSession,
+    prompt: str,
+    request_id: int,
+    *,
+    timeout: float = 120.0,
+) -> tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """One `tools: true` request: its record, its `tool` events, its tokens."""
+    marker = bridge.event_count()
+    reply = bridge.request(
+        "generate",
+        timeout=60.0,
+        prompt=prompt,
+        request=request_id,
+        tools=True,
+        max_tokens=TOOL_MAX_TOKENS,
+    )
+    assert reply["ok"] is True, reply
+    assert reply["result"] == {"request": request_id}, reply
+    record = bridge.wait_for(
+        "request_end",
+        after=marker,
+        timeout=timeout,
+        predicate=lambda data: data["request"] == request_id,
+    )
+    events = [
+        event for event in bridge.event_log("tool", marker) if event["request"] == request_id
+    ]
+    tokens = [
+        event for event in bridge.events("token") if event["request"] == request_id
+    ]
+    return record, events, tokens
+
+
+def _tool_call(
+    bridge: BridgeSession, prompts: List[str]
+) -> tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Send each prompt in turn; return the first result that asked for a tool."""
+    result: Optional[tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]] = None
+    for prompt in prompts:
+        request_id = next(_TOOL_REQUEST_IDS)
+        result = _tool_request(bridge, prompt, request_id)
+        if any(event["phase"] == "call" for event in result[1]):
+            break
+    assert result is not None
+    return result
+
+
+def _asked_tool_call(
+    bridge: BridgeSession, prompt: str, *, attempts: int = TOOL_CALL_ATTEMPTS
+) -> tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """A plain request: the model has to decide for itself to use a tool."""
+    return _tool_call(bridge, [prompt] * attempts)
+
+
+def _forced_tool_call(
+    bridge: BridgeSession,
+    instruction: str,
+    call_json: str,
+    *,
+    attempts: int = TOOL_ATTEMPTS,
+) -> tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Ask the model for one specific call until it makes one.
+
+    The call is echoed back in the format the model is shown, which is what
+    makes a 0.6B model reach for a tool it would otherwise only describe.
+    Nothing about the *execution* is faked: the bridge parses the model's own
+    output, runs the real tool against the real file system and reports what it
+    returned.
+    """
+    # A 0.6B model can reason its way past the budget without ever emitting the
+    # call, and repeating the same wording can reproduce that. The shorter ask is
+    # the fallback: the model still produces the call itself.
+    asked = f"{instruction} Reply with only this tool call and nothing else: {call_json}"
+    fallback = f"Reply with only this tool call and nothing else: {call_json}"
+    return _tool_call(bridge, [asked] + [fallback] * (attempts - 1))
+
+
+def _tool_calls(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [event for event in events if event["phase"] == "call"]
+
+
+def _tool_results(
+    events: List[Dict[str, Any]], name: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    return [
+        event
+        for event in events
+        if event["phase"] == "result" and (name is None or event["name"] == name)
+    ]
+
+
+def step_tools_run_a_real_file_call(bridge: BridgeSession) -> None:
+    """`tools: true` reports the call and the result, and the tool really ran."""
+    ensure_loaded(bridge)
+    record, events, tokens = _forced_tool_call(
+        bridge,
+        f"Call read_file on {TOOL_FILE_NAME}.",
+        f'<tool_call>{{"name": "read_file", "arguments": {{"path": "{TOOL_FILE_NAME}"}}}}</tool_call>',
+    )
+    calls = _tool_calls(events)
+    results = _tool_results(events)
+    assert calls, f"the model never asked for a tool: {record}"
+    assert len(results) == len(calls), events
+
+    call = calls[0]
+    assert set(call) == TOOL_EVENT_KEYS, call
+    assert call["request"] == record["request"], (call, record)
+    assert call["round"] == 1, call
+    assert call["name"] == "read_file", call
+    # The model may spell out a documented default (`max_bytes`) or leave it
+    # out; what it may not do is invent an argument.
+    arguments = call["arguments"]
+    assert isinstance(arguments, dict), call
+    assert arguments.get("path") == TOOL_FILE_NAME, call
+    assert set(arguments) <= {"path", "max_bytes"}, call
+    assert call["ok"] is True, call
+    assert TOOL_FILE_NAME in call["summary"], call
+    assert call["detail"] is None, call
+
+    result = results[0]
+    assert set(result) == TOOL_EVENT_KEYS, result
+    assert result["phase"] == "result", result
+    assert result["round"] == call["round"], (result, call)
+    assert result["name"] == call["name"], (result, call)
+    assert result["arguments"] is None, result
+    assert result["ok"] is True, result
+    # The tool read the real file: its exact bytes are in the detail.
+    assert TOOL_FILE_TEXT.strip() in (result["detail"] or ""), result
+    assert str(len(TOOL_FILE_TEXT.encode("utf-8"))) in result["summary"], result
+
+    # The record counts every executed call, and it finished cleanly.
+    assert record["toolCalls"] == len(calls), (record, calls)
+    assert record["finishReason"] in ("length", "stop"), record
+    assert record["promptTokens"] > 0 and record["genTokens"] > 0, record
+
+    # The streamed answer is the *final* round's text: a call round's
+    # scaffolding is reported as a `tool` event, never as answer text.
+    answer = "".join(token["text"] for token in tokens)
+    assert answer.strip(), f"the answer round streamed nothing: {record}"
+    assert "<tool_call>" not in answer, answer
+    assert tokens[-1]["index"] == record["genTokens"], (tokens[-1], record)
+    assert all(
+        tokens[index + 1]["ttsMs"] >= tokens[index]["ttsMs"]
+        for index in range(len(tokens) - 1)
+    ), "token timestamps went backwards"
+    print(f"read_file result: {result['summary']}; answer {answer[:80]!r}")
+
+
+def step_tools_list_and_describe_real_paths(bridge: BridgeSession) -> None:
+    """`list_directory` and `file_info` return the real entries and metadata."""
+    ensure_loaded(bridge)
+    _, events, _ = _forced_tool_call(
+        bridge,
+        "Call list_directory with the path \".\".",
+        '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>',
+    )
+    listings = _tool_results(events, "list_directory")
+    assert listings, f"the model never called list_directory: {events}"
+    listing = listings[0]
+    assert listing["ok"] is True, listing
+    detail = listing["detail"] or ""
+    assert TOOL_FILE_NAME in detail, listing
+    assert TOOL_NESTED_DIR in detail, listing
+    assert "file" in detail and "directory" in detail, listing
+    print(f"list_directory: {listing['summary']}")
+
+    _, events, _ = _forced_tool_call(
+        bridge,
+        f"Call file_info on {TOOL_FILE_NAME}.",
+        f'<tool_call>{{"name": "file_info", "arguments": {{"path": "{TOOL_FILE_NAME}"}}}}</tool_call>',
+    )
+    infos = _tool_results(events, "file_info")
+    assert infos, f"the model never called file_info: {events}"
+    info = infos[0]
+    assert info["ok"] is True, info
+    detail = info["detail"] or ""
+    assert "kind: file" in detail, info
+    assert f"bytes: {len(TOOL_FILE_TEXT.encode('utf-8'))}" in detail, info
+    stamp = detail.split("modified: ")[-1].strip()
+    assert "T" in stamp and ("+" in stamp or stamp.endswith("Z")), detail
+    print(f"file_info: {info['summary']}")
+
+
+def step_tools_find_a_nested_file(bridge: BridgeSession) -> None:
+    """`search_files` globs recursively inside the tool root."""
+    ensure_loaded(bridge)
+    _, events, _ = _forced_tool_call(
+        bridge,
+        'Call search_files with pattern "**/*.txt".',
+        '<tool_call>{"name": "search_files", "arguments": {"pattern": "**/*.txt"}}</tool_call>',
+    )
+    results = _tool_results(events, "search_files")
+    assert results, f"the model never called search_files: {events}"
+    result = results[0]
+    assert result["ok"] is True, result
+    detail = result["detail"] or ""
+    # The nested file is one level down: only a recursive search finds it.
+    assert TOOL_NESTED_NAME in detail, result
+    assert f"{TOOL_NESTED_DIR}/{TOOL_NESTED_NAME}" in detail, result
+    assert TOOL_FILE_NAME in detail, result
+    print(f"search_files: {result['summary']}")
+
+
+def step_tools_refuse_a_path_outside_the_root(bridge: BridgeSession) -> None:
+    """A path outside $SLAM_LM_TOOL_ROOT is refused, and the request survives."""
+    ensure_loaded(bridge)
+    record, events, _ = _forced_tool_call(
+        bridge,
+        f"Call read_file with exactly this path: {OUTSIDE_PATH}.",
+        f'<tool_call>{{"name": "read_file", "arguments": {{"path": "{OUTSIDE_PATH}"}}}}</tool_call>',
+    )
+    results = _tool_results(events)
+    assert results, f"the model never asked for a tool: {events}"
+    refused = results[0]
+    assert refused["ok"] is False, refused
+    assert "outside the tool root" in refused["summary"], refused
+    assert OUTSIDE_PATH in refused["summary"], refused
+    assert refused["arguments"] is None, refused
+
+    # The refusal is fed back, not fatal: the request still ends with a record.
+    assert record["finishReason"] in ("length", "stop"), record
+    assert record["toolCalls"] == len(_tool_calls(events)), (record, events)
+    print(f"refused: {refused['summary']}")
+
+
+def step_tools_report_an_unknown_tool(bridge: BridgeSession) -> None:
+    """A tool the model invented is an `ok:false` result, not a crash."""
+    ensure_loaded(bridge)
+    record, events, _ = _forced_tool_call(
+        bridge,
+        "Call the delete_file tool.",
+        f'<tool_call>{{"name": "delete_file", "arguments": {{"path": "{TOOL_FILE_NAME}"}}}}</tool_call>',
+    )
+    results = _tool_results(events, "delete_file")
+    assert results, f"the model never called the invented tool: {events}"
+    result = results[0]
+    assert result["ok"] is False, result
+    assert "unknown tool" in result["summary"], result
+    assert "delete_file" in (result["detail"] or ""), result
+
+    # Nothing was written, and the bridge answered the request regardless.
+    assert (bridge.tool_root / TOOL_FILE_NAME).read_text(encoding="utf-8") == TOOL_FILE_TEXT
+    assert record["finishReason"] in ("length", "stop"), record
+    assert record["toolCalls"] == len(_tool_calls(events)), (record, events)
+    print(f"unknown tool: {result['summary']}")
+
+
+def step_tools_search_the_real_web(bridge: BridgeSession) -> None:
+    """`web_search` reaches the real web, or fails naming every provider."""
+    ensure_loaded(bridge)
+    _, events, _ = _forced_tool_call(
+        bridge,
+        'Call web_search with the query "mlx lm" and max_results 3.',
+        '<tool_call>{"name": "web_search", "arguments": {"query": "mlx lm", "max_results": 3}}</tool_call>',
+    )
+    results = _tool_results(events, "web_search")
+    assert results, f"the model never called web_search: {events}"
+    successes = [result for result in results if result["ok"]]
+    if successes:
+        # Success means real, non-empty results from a named provider.
+        result = successes[0]
+        detail = result["detail"] or ""
+        assert detail.startswith("provider: "), result
+        assert "\n1. " in detail, result
+        assert "http" in detail, result
+        assert result["summary"] != "0 results", result
+        print(f"web_search: {result['summary']}\n{detail[:300]}")
+        return
+
+    # Every call failed: the detail must name each provider with its real
+    # reason, and no result may be dressed up as an empty success. DuckDuckGo
+    # rate-limits this machine, so a failed ladder is a legitimate outcome.
+    result = results[-1]
+    detail = result["detail"] or ""
+    reasons = [line for line in detail.splitlines() if line.startswith("- ")]
+    assert result["summary"] == "every search provider failed", result
+    assert len(reasons) > 1, result
+    assert all(reason.split(": ", 1)[1].strip() for reason in reasons), result
+    print(f"web_search: {result['summary']}\n{detail}")
+
+
+def step_http_accepts_tools(bridge: BridgeSession) -> None:
+    """`tools` works over HTTP too: the completion runs the real tool loop.
+
+    The answer arrives through the same sink as any other completion, so a tool
+    request's final round is streamed to the HTTP client rather than swallowed
+    with the scaffolding.
+    """
+    ensure_loaded(bridge)
+    port = _free_port()
+    base = bridge.request("serve", port=port)["result"]["url"]
+    marker = bridge.event_count()
+    _, completion = _http(
+        f"{base}/v1/chat/completions",
+        {
+            "model": MODEL_ID,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Call read_file on {TOOL_FILE_NAME}. Reply with only this tool call "
+                    "and nothing else: "
+                    f'<tool_call>{{"name": "read_file", "arguments": {{"path": "{TOOL_FILE_NAME}"}}}}</tool_call>',
+                }
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+            "max_tokens": TOOL_MAX_TOKENS,
+        },
+    )
+    record = bridge.wait_for(
+        "request_end",
+        after=marker,
+        timeout=120.0,
+        predicate=lambda data: data["request"] >= 1_000_000,
+    )
+    events = [
+        event for event in bridge.event_log("tool", marker) if event["request"] == record["request"]
+    ]
+    assert [event for event in events if event["phase"] == "call"], events
+    assert [event for event in events if event["phase"] == "result"], events
+    assert record["toolCalls"] == len([e for e in events if e["phase"] == "call"]), (
+        record,
+        events,
+    )
+    # Every round's tokens are in the usage; the visible answer is the last one.
+    assert completion["usage"]["completion_tokens"] == record["genTokens"], (
+        completion,
+        record,
+    )
+    content = completion["choices"][0]["message"]["content"]
+    assert content.strip(), completion
+    assert "<tool_call>" not in content, content
+    print(f"http tools: toolCalls={record['toolCalls']} completion={content[:60]!r}")
+
+
+def step_tools_offer_the_tools_through_the_chat_template(
+    bridge: BridgeSession,
+) -> None:
+    """A plain request makes these models call a tool, because they are offered.
+
+    The tools go to the tokenizer's chat template as `tools=` schemas, which is
+    what puts them in the model's system turn. Measured on this model: with the
+    written instructions only, the same request narrates a fake search instead
+    of calling; with the template's own tools block it emits the real call.
+    """
+    ensure_loaded(bridge)
+    record, events, tokens = _asked_tool_call(
+        bridge, "What is the latest MLX release version? Use your web_search tool."
+    )
+    calls = _tool_calls(events)
+    assert calls, (
+        "the model answered a plain request without calling a tool: "
+        f"genTokens={record['genTokens']}, finishReason={record['finishReason']}"
+    )
+    call = calls[0]
+    assert call["name"] == "web_search", calls
+    query = (call["arguments"] or {}).get("query")
+    assert isinstance(query, str) and query.strip(), calls
+    results = _tool_results(events, "web_search")
+    assert results, events
+    assert isinstance(results[0]["ok"], bool), results
+    print(f"offered through the template: {call['summary']} -> {results[0]['summary']}")
+
+
+def step_tools_fallback_written_instructions(bridge: BridgeSession) -> None:
+    """A template that ignores `tools=` still gets working tools.
+
+    Qwen1.5's chat template has no notion of tools, so the bridge falls back to
+    the written instructions and the plain `tool` role messages. The prompt is
+    the fence spelling *inside* a sentence, which is what this model actually
+    emits (measured: an inline ```tool block after a line of prose).
+    """
+    loaded = bridge.request("load", model=OTHER_MODEL_ID)["result"]
+    assert loaded["model"] == OTHER_MODEL_ID, loaded
+    try:
+        prompt = (
+            f"To read the file {TOOL_FILE_NAME} you can use the following command: "
+            f'```tool {{"name": "read_file", "arguments": {{"path": "{TOOL_FILE_NAME}"}}}}```'
+        )
+        record, events, _ = _tool_call(bridge, [prompt] * TOOL_CALL_ATTEMPTS)
+        calls = _tool_calls(events)
+        assert calls, f"the model never called a tool: genTokens={record['genTokens']}"
+        assert calls[0]["name"] == "read_file", calls
+        assert calls[0]["arguments"] == {"path": TOOL_FILE_NAME}, calls
+        results = _tool_results(events, "read_file")
+        assert results, events
+        assert results[0]["ok"] is True, results[0]
+        # The inline fence was parsed, and the tool then read the real file.
+        assert TOOL_FILE_TEXT.strip() in (results[0]["detail"] or ""), results[0]
+        assert record["finishReason"] in ("length", "stop"), record
+        assert record["toolCalls"] == len(calls), (record, calls)
+        print(
+            f"written instructions on {OTHER_MODEL_ID}: "
+            f"{calls[0]['summary']} -> {results[0]['summary']}"
+        )
+    finally:
+        ensure_loaded(bridge)
+
+
+def step_generate_without_a_token_budget(bridge: BridgeSession) -> None:
+    """No `max_tokens` means no limit: the model stops when it is done.
+
+    PROTOCOL.md removed the user-facing budget, so the only ceiling is the
+    model's own context window. `LONG_PROMPT` is an existing prompt whose tests
+    cap it at `LONG_MAX_TOKENS` (400) — and which the HTTP API's old fixed
+    default (256) also capped: the essay it produces here is longer than both,
+    and it ends because the model ended it, not because a budget ran out.
+    """
+    ensure_loaded(bridge)
+    request_id = next(_CHAT_REQUEST_IDS)
+    marker = bridge.event_count()
+    reply = bridge.request(
+        "generate", timeout=60.0, prompt=LONG_PROMPT, request=request_id, chat=True
+    )
+    assert reply["ok"] is True, reply
+    assert reply["result"] == {"request": request_id}, reply
+    record = bridge.wait_for(
+        "request_end",
+        after=marker,
+        timeout=300.0,
+        predicate=lambda data: data["request"] == request_id,
+    )
+    assert record["finishReason"] == "stop", record
+    assert record["genTokens"] > LONG_MAX_TOKENS, record
+    assert record["genTokens"] > 256, record  # the HTTP API's old default budget
+    assert record["totalMs"] > 0 and record["decodeTps"] > 0, record
+
+    tokens = [
+        event for event in bridge.events("token") if event["request"] == request_id
+    ]
+    assert tokens, record
+    assert tokens[-1]["index"] == record["genTokens"], (tokens[-1], record)
+    assert "".join(token["text"] for token in tokens).strip(), record
+    print(
+        f"no budget: {record['genTokens']} tokens, finishReason={record['finishReason']}, "
+        f"{record['totalMs'] / 1000.0:.1f}s"
+    )
 
 
 # MARK: - Machine-wide memory (Activity Monitor's numbers)
@@ -1522,6 +2041,16 @@ STEPS: List[tuple[str, Callable[[BridgeSession], None]]] = [
     ("generate without chat", step_generate_without_chat_keeps_the_raw_prompt),
     ("generate chat rejects an empty prompt", step_generate_chat_rejects_the_empty_raw_prompt),
     ("generate with junk chat values", step_generate_chat_junk_values),
+    ("tools: a real file call", step_tools_run_a_real_file_call),
+    ("tools: list and describe real paths", step_tools_list_and_describe_real_paths),
+    ("tools: find a nested file", step_tools_find_a_nested_file),
+    ("tools: refuse a path outside the root", step_tools_refuse_a_path_outside_the_root),
+    ("tools: report an unknown tool", step_tools_report_an_unknown_tool),
+    ("tools: search the real web", step_tools_search_the_real_web),
+    ("tools: offered through the chat template", step_tools_offer_the_tools_through_the_chat_template),
+    ("tools: written-instruction fallback", step_tools_fallback_written_instructions),
+    ("http accepts tools", step_http_accepts_tools),
+    ("generate with no token budget", step_generate_without_a_token_budget),
     ("generate with chat and no model", step_generate_chat_without_a_model),
     ("system memory matches the os", step_system_memory_matches_the_os),
     ("system memory invariants", step_system_memory_invariants),
@@ -1621,6 +2150,185 @@ def test_generate_chat_junk_values_are_only_truthy() -> None:
     step_generate_chat_junk_values(session())
 
 
+def test_tools_call_and_result_events_are_the_contract() -> None:
+    step_tools_run_a_real_file_call(session())
+
+
+def test_tools_list_directory_and_file_info_are_real() -> None:
+    step_tools_list_and_describe_real_paths(session())
+
+
+def test_tools_search_files_finds_a_nested_file() -> None:
+    step_tools_find_a_nested_file(session())
+
+
+def test_tools_refuse_a_path_outside_the_root() -> None:
+    step_tools_refuse_a_path_outside_the_root(session())
+
+
+def test_tools_report_an_unknown_tool() -> None:
+    step_tools_report_an_unknown_tool(session())
+
+
+def test_tools_web_search_hits_the_real_endpoint() -> None:
+    step_tools_search_the_real_web(session())
+
+
+# MARK: - The web_search provider ladder
+
+#: A query whose answer has to come from the real web.
+SEARCH_QUERY = "mlx lm apple silicon"
+#: The two lines one rendered result occupies: `1. A title`, then its own URL.
+_RESULT_TITLE_RE = re.compile(r"^\d+\. (\S.*)$", re.MULTILINE)
+_RESULT_URL_RE = re.compile(r"^   (https?://\S+)$", re.MULTILINE)
+#: The reasons that mean "no provider could answer *here*", rather than "the
+#: provider answered and the parser saw nothing": a transport failure, or a
+#: rate-limit refusal. DuckDuckGo answers this machine 202 and Brave answers 429
+#: after a burst; neither is a defect in the parse.
+_UNREACHABLE_REASONS = ("unreachable", "timed out", "HTTP 202", "HTTP 429")
+
+
+def _tools_module() -> Any:
+    """The `slam_lm_bridge.tools` module under test, imported in this process."""
+    root = str(BRIDGE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import slam_lm_bridge.tools as tools
+
+    return tools
+
+
+def _pytest() -> Any:
+    """`pytest`, imported late: the plain-script entry point does not need it."""
+    import pytest
+
+    return pytest
+
+
+def test_web_search_answers_from_this_machine() -> None:
+    """A real query returns real results, and the detail names the provider.
+
+    The ladder is keyless HTML endpoints, and DuckDuckGo rate-limits this
+    machine, so this is the test that the *capability* works here right now.
+    Only no provider being able to answer at all — every reason a transport
+    failure or a rate-limit refusal — is a skip; a provider that answered and
+    produced nothing is a failure, because a broken parse is the defect this
+    ladder exists to survive.
+    """
+    tools = _tools_module()
+    call = tools.ToolCall("web_search", {"query": SEARCH_QUERY, "max_results": 3})
+    result = tools.ToolRegistry().execute(call)
+    detail = result.detail or ""
+
+    if not result.ok:
+        reasons = re.findall(r"^- ([\w-]+): (.+)$", detail, re.MULTILINE)
+        assert reasons, (result.summary, detail)
+        if all(any(bad in reason for bad in _UNREACHABLE_REASONS) for _, reason in reasons):
+            _pytest().skip(f"no search provider can answer from this machine: {detail}")
+        _pytest().fail(f"no provider produced a result: {detail}")
+
+    header, _, results = detail.partition("\n")
+    assert header.startswith("provider: "), detail
+    answered = header[len("provider: ") :].strip()
+    assert answered in {entry.name for entry in tools.SEARCH_PROVIDERS}, detail
+
+    titles = _RESULT_TITLE_RE.findall(results)
+    urls = _RESULT_URL_RE.findall(results)
+    assert titles and urls, detail
+    assert all(title.strip() for title in titles), detail
+    assert all(url.startswith("http") for url in urls), detail
+    # Every rendered result carries exactly one URL line, so the summary's count
+    # is the number of real results the tool is claiming.
+    assert result.summary == f"{len(urls)} results", (result.summary, detail)
+    print(f"web_search answered by {answered}: {detail[:300]}")
+
+
+def test_web_search_falls_through_a_page_with_no_results(monkeypatch: Any) -> None:
+    """A 200 holding no result link is a fall-through, not the end of the search.
+
+    The first entry is pointed at a real 200 page that carries no result link
+    (`duckduckgo.com/robots.txt`) and the rest at a closed local port. Both real
+    reasons have to appear in the detail, and the walk has to reach the closed
+    port at all, which is only possible if the empty 200 did not end the search
+    — the defect this ladder fixes.
+    """
+    tools = _tools_module()
+    first, *rest = tools.SEARCH_PROVIDERS
+    assert rest, tools.SEARCH_PROVIDERS
+    monkeypatch.setattr(
+        tools,
+        "SEARCH_PROVIDERS",
+        (
+            dataclasses.replace(
+                first, template="https://duckduckgo.com/robots.txt?{query}"
+            ),
+            *(
+                dataclasses.replace(provider, template="http://127.0.0.1:1/search?{query}")
+                for provider in rest
+            ),
+        ),
+    )
+
+    call = tools.ToolCall("web_search", {"query": "mlx lm"})
+    result = tools.ToolRegistry().execute(call)
+    detail = result.detail or ""
+
+    assert result.ok is False, result
+    if f"- {first.name}: unreachable" in detail:
+        _pytest().skip(f"duckduckgo.com is unreachable from this machine: {detail}")
+    assert f"- {first.name}: HTTP 200 but the page held no result link" in detail, detail
+    assert "unreachable" in detail, detail
+    assert len([line for line in detail.splitlines() if line.startswith("- ")]) == 1 + len(
+        rest
+    ), detail
+    assert not _RESULT_TITLE_RE.search(detail), detail
+    assert not _RESULT_URL_RE.search(detail), detail
+
+
+def test_web_search_names_every_provider_when_they_all_fail(monkeypatch: Any) -> None:
+    """When the whole ladder fails, the detail names each provider and why.
+
+    Every entry is pointed at a closed local port: `urllib` really connects,
+    really gets refused, and the reason reported is the socket's own. Nothing
+    is faked, and the walk is proven to reach every provider rather than
+    stopping at the first failure.
+    """
+    tools = _tools_module()
+    unreachable = tuple(
+        dataclasses.replace(provider, template="http://127.0.0.1:1/search?{query}")
+        for provider in tools.SEARCH_PROVIDERS
+    )
+    assert len(unreachable) > 1, unreachable
+    monkeypatch.setattr(tools, "SEARCH_PROVIDERS", unreachable)
+
+    call = tools.ToolCall("web_search", {"query": "mlx lm", "max_results": 3})
+    result = tools.ToolRegistry().execute(call)
+    detail = result.detail or ""
+
+    assert result.ok is False, result
+    assert result.summary == "every search provider failed", result
+    for provider in unreachable:
+        assert f"- {provider.name}: unreachable: " in detail, detail
+    assert not _RESULT_TITLE_RE.search(detail), detail
+    assert not _RESULT_URL_RE.search(detail), detail
+
+
+def test_tools_are_offered_through_the_chat_template() -> None:
+    step_tools_offer_the_tools_through_the_chat_template(session())
+
+
+def test_tools_fall_back_to_written_instructions() -> None:
+    step_tools_fallback_written_instructions(session())
+
+
+def test_http_api_accepts_tools() -> None:
+    step_http_accepts_tools(session())
+
+
+def test_generate_without_max_tokens_is_unlimited() -> None:
+    step_generate_without_a_token_budget(session())
+
+
 def test_generate_chat_without_a_model_fails() -> None:
     step_generate_chat_without_a_model(session())
 
@@ -1639,6 +2347,42 @@ def test_hello_and_metrics_agree_on_system_memory() -> None:
 
 def test_system_memory_is_live() -> None:
     step_system_memory_is_live(session())
+
+
+def test_parse_calls_accepts_both_spellings() -> None:
+    """PROTOCOL.md's two call spellings, anywhere in the text, in order."""
+    parse_calls = _tools_module().parse_calls
+
+    def pairs(text: str) -> List[tuple[str, Any]]:
+        return [(call.name, call.arguments) for call in parse_calls(text)]
+
+    # The tag form, after thinking text on the same line.
+    assert pairs(
+        'I will look that up.<tool_call>{"name": "read_file", '
+        '"arguments": {"path": "note.txt"}}</tool_call>'
+    ) == [("read_file", {"path": "note.txt"})]
+    # Case-insensitive, and tolerant of the tag's own newlines.
+    assert pairs(
+        '<TOOL_CALL>\n{"name": "file_info", "arguments": {"path": "a"}}\n</TOOL_CALL>'
+    ) == [("file_info", {"path": "a"})]
+    # The fenced form, with the JSON on its own line...
+    assert pairs(
+        'Let me check.\n```tool\n{"name": "web_search", "arguments": {"query": "x"}}\n```'
+    ) == [("web_search", {"query": "x"})]
+    # ...and inline inside a sentence, which is what a real 0.5B model emits.
+    assert pairs(
+        "To find all files on your desktop, you can use the following command:  "
+        '```tool {"name": "list_directory", "arguments": {"path": "your desktop"}} ```'
+    ) == [("list_directory", {"path": "your desktop"})]
+    # Every call in one reply, in order, across both spellings.
+    assert pairs(
+        '<tool_call>{"name": "a", "arguments": {}}</tool_call> then '
+        '```tool {"name": "b", "arguments": {"x": 1}}```'
+    ) == [("a", {}), ("b", {"x": 1})]
+    # Malformed JSON and prose are not calls, and a fence must say `tool`.
+    assert pairs('<tool_call>{not json}</tool_call>') == []
+    assert pairs('```toolbar\n{"name": "a", "arguments": {}}\n```') == []
+    assert pairs("The capital of France is Paris.") == []
 
 
 # MARK: - Plain-script entry point

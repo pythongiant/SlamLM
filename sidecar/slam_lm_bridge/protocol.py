@@ -207,6 +207,7 @@ class RequestRecord(_Wire):
     peakMemBytes: int
     startedAt: float
     totalMs: float
+    toolCalls: int
     finishReason: str
 
 

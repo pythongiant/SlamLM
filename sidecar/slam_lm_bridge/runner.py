@@ -27,6 +27,19 @@ import mlx.core as mx
 from . import catalog
 from .metrics import HardwareProbe, RunnerStats, live_metrics
 from .protocol import RequestRecord, StatePayload, TokenPayload, monotonic_ms, sanitise_float
+from .tools import (
+    TOOL_ROUNDS,
+    ToolCall,
+    ToolRegistry,
+    ToolResult,
+    call_summary as _call_summary,
+    parse_calls,
+    tool_schemas,
+)
+
+#: PROTOCOL.md's fallback context window for an unlimited request when the
+#: model's own config does not say.
+DEFAULT_CONTEXT_WINDOW = 4096
 
 #: Prompt used for the post-load warmup: it exercises the real prefill path so
 #: the first user prompt pays no one-off compile cost (mlx-lm's own `generate`
@@ -101,11 +114,15 @@ class _Job:
 class _GenerateRequest:
     request: int
     prompt: str
-    max_tokens: int
+    #: `None` means no limit: PROTOCOL.md's ceiling is then the model's context
+    #: window, not a budget the bridge invents.
+    max_tokens: Optional[int]
     cancel_seq: int
     submitted_perf: float
     submitted_wall: float
     sink: Optional[Callable[[Dict[str, Any]], None]] = None
+    #: Let the model call the read-only tools before it answers.
+    tools: bool = False
 
 
 @dataclass
@@ -115,11 +132,74 @@ class _Loaded:
 
 
 @dataclass
+class _Progress:
+    """One request's progress across every round it generates."""
+
+    started: float
+    started_at: float
+    ttft_ms: float = 0.0
+    prompt_tokens: int = 0
+    gen_tokens: int = 0
+    first: Optional[float] = None
+    last: Optional[float] = None
+    tool_calls: int = 0
+    last_response: Any = None
+
+
+@dataclass
 class _Outcome:
     """One finished generation: its protocol record plus any error message."""
 
     record: RequestRecord
     error: Optional[str] = None
+
+
+def _call_event(request: int, round_number: int, call: ToolCall) -> Dict[str, Any]:
+    """PROTOCOL.md's `tool` event for the call itself."""
+    arguments = call.arguments if isinstance(call.arguments, dict) else None
+    return {
+        "request": request,
+        "round": round_number,
+        "phase": "call",
+        "name": call.name,
+        "arguments": arguments,
+        "ok": True,
+        "summary": _call_summary(call),
+        "detail": None,
+    }
+
+
+def _result_event(
+    request: int, round_number: int, call: ToolCall, result: ToolResult
+) -> Dict[str, Any]:
+    """PROTOCOL.md's `tool` event for what the call returned."""
+    return {
+        "request": request,
+        "round": round_number,
+        "phase": "result",
+        "name": call.name,
+        "arguments": None,
+        "ok": result.ok,
+        "summary": result.summary,
+        "detail": result.detail,
+    }
+
+
+def _plain_transcript(messages: List[Dict[str, Any]]) -> str:
+    """The tool loop as plain text, for a tokenizer with no chat template."""
+    parts: List[str] = []
+    for message in messages:
+        role = message.get("role")
+        content = str(message.get("content", ""))
+        if role == "system":
+            parts.append(content)
+        elif role == "user":
+            parts.append(f"User: {content}")
+        elif role == "assistant":
+            parts.append(f"Assistant: {content}")
+        else:
+            parts.append(f"Tool result ({message.get('name', 'tool')}):\n{content}")
+    return "\n\n".join(parts)
 
 
 class Runner:
@@ -140,6 +220,11 @@ class Runner:
         self._store = store
         self._hf_home = hf_home
         self._extra_dirs = extra_dirs
+        # The read-only tools, confined to $SLAM_LM_TOOL_ROOT (or $HOME).
+        self._tools = ToolRegistry()
+        # Whether the loaded tokenizer's chat template takes `tools=`. Probed
+        # once per load, on the worker thread, and None until then.
+        self._tools_template: Optional[bool] = None
 
         self._jobs: "queue.Queue[Optional[_Job]]" = queue.Queue()
 
@@ -240,29 +325,37 @@ class Runner:
     def submit(
         self,
         prompt: str,
-        max_tokens: int,
+        max_tokens: Optional[int],
         request: int,
         sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         chat: bool = False,
+        tools: bool = False,
     ) -> int:
         """Queue one generation; returns the request id it will report.
 
+        `max_tokens` is optional: omitted or `None` means no limit, and the only
+        ceiling is then the model's own context window (see `_stream_round`).
         With `chat` the prompt is first rendered as a single `user` message
         through `chat_prompt`, so the worker prefills exactly what the HTTP API
         would send. The raw text is what gets validated, and `chat` is only
         consulted after every other check has passed, so a falsy or missing
         value keeps the historical verbatim-prompt behaviour.
+
+        With `tools` the worker runs PROTOCOL.md's bounded tool loop instead of
+        a single generation.
         """
         if not isinstance(prompt, str):
             raise BridgeError("generate requires a prompt string")
         if not prompt.strip():
             raise BridgeError("generate requires a non-empty prompt")
-        try:
-            tokens = int(max_tokens)
-        except (TypeError, ValueError):
-            raise BridgeError("generate requires max_tokens as an integer") from None
-        if tokens < 1:
-            raise BridgeError("max_tokens must be at least 1")
+        tokens: Optional[int] = None
+        if max_tokens is not None:
+            try:
+                tokens = int(max_tokens)
+            except (TypeError, ValueError):
+                raise BridgeError("generate requires max_tokens as an integer") from None
+            if tokens < 1:
+                raise BridgeError("max_tokens must be at least 1")
         if not isinstance(request, int) or request <= 0:
             raise BridgeError("generate requires a positive request id")
 
@@ -273,10 +366,11 @@ class Runner:
             self._outstanding += 1
 
         try:
-            if chat:
+            if chat and not tools:
                 # Rendered here, before queueing: `_GenerateRequest.prompt` then
                 # carries the text the tokenizer's chat template produced, so
-                # the worker and every event it emits are untouched.
+                # the worker and every event it emits are untouched. The tool
+                # loop renders itself, round by round, on the worker thread.
                 prompt = self.chat_prompt([{"role": "user", "content": prompt}])
         except BaseException:
             with self._lock:
@@ -291,6 +385,7 @@ class Runner:
             submitted_perf=time.perf_counter(),
             submitted_wall=time.time(),
             sink=sink,
+            tools=tools,
         )
 
         def run() -> Any:
@@ -355,6 +450,7 @@ class Runner:
         except Exception as exc:
             self._model = None
             self._tokenizer = None
+            self._tools_template = None
             with self._lock:
                 self._loaded = _Loaded()
             self._stats.set_load_ms(0.0)
@@ -367,6 +463,7 @@ class Runner:
         load_ms = monotonic_ms(started)
         self._model = model
         self._tokenizer = tokenizer
+        self._tools_template = None
         with self._lock:
             self._loaded = _Loaded(model_id=model_id, load_ms=load_ms)
         self._stats.set_load_ms(load_ms)
@@ -417,6 +514,7 @@ class Runner:
             self._state("loading", "load", "unloading")
         self._model = None
         self._tokenizer = None
+        self._tools_template = None
         with self._lock:
             self._loaded = _Loaded()
             self._active_request = None
@@ -473,81 +571,125 @@ class Runner:
             peakMemBytes=int(mx.get_peak_memory()),
             startedAt=time.time(),
             totalMs=0.0,
+            toolCalls=0,
             finishReason="error",
         )
 
-    def _run_generation(self, req: _GenerateRequest) -> _Outcome:
-        model, tokenizer, model_id = self._model, self._tokenizer, self._loaded.model_id
-        if model is None or tokenizer is None or model_id is None:
-            raise BridgeError("no model loaded")
+    # MARK: - Worker-thread generation
+
+    def _context_window(self) -> int:
+        """The loaded model's context length, from its own config.
+
+        PROTOCOL.md's ceiling for an unlimited request: the model's
+        `max_position_embeddings` when the config says, 4096 when it does not.
+        """
+        for source in (
+            getattr(self._model, "args", None),
+            getattr(self._model, "config", None),
+        ):
+            if source is None:
+                continue
+            value = (
+                source.get("max_position_embeddings")
+                if isinstance(source, dict)
+                else getattr(source, "max_position_embeddings", None)
+            )
+            try:
+                window = int(value)
+            except (TypeError, ValueError):
+                continue
+            if window > 0:
+                return window
+        return DEFAULT_CONTEXT_WINDOW
+
+    def _stream_round(
+        self,
+        req: _GenerateRequest,
+        progress: _Progress,
+        prompt: str,
+        max_tokens: int,
+        emit: bool,
+    ) -> tuple[str, Optional[str], Optional[str], List[Dict[str, Any]]]:
+        """One `stream_generate` pass over `prompt`.
+
+        Returns ``(text, finish_reason, error, buffered)``. `emit` streams the
+        tokens as they are produced (the plain path); otherwise they are
+        buffered so a round that turns out to be tool scaffolding is never
+        streamed as answer text.
+
+        An unlimited pass (`max_tokens < 0`) stops at the model's context
+        window minus the prompt, so `-1` can never spin forever.
+        """
+        model, tokenizer = self._model, self._tokenizer
         _, stream_generate = _mlx_lm()
-
-        with self._lock:
-            self._active_request = req.request
-        self._state("generating", "prefill", None)
-
-        started_at = req.submitted_wall
-        started = req.submitted_perf
-        prompt_tokens = 0
-        gen_tokens = 0
-        ttft_ms = 0.0
-        first: Optional[float] = None
-        last: Optional[float] = None
-        last_response: Any = None
+        base = progress.gen_tokens
+        parts: List[str] = []
+        buffered: List[Dict[str, Any]] = []
+        count = 0
         finish_reason: Optional[str] = None
         error_message: Optional[str] = None
         generator: Any = None
+        ceiling: Optional[int] = None
 
         try:
-            if self._cancelled(req.cancel_seq):
-                # Cancelled between submit and start: never touch the model.
-                finish_reason = "cancel"
-            else:
-                generator = stream_generate(
-                    model,
-                    tokenizer,
-                    req.prompt,
-                    max_tokens=req.max_tokens,
-                )
-                for response in generator:
-                    now = time.perf_counter()
-                    if first is None:
-                        first = now
-                        ttft_ms = monotonic_ms(started)
-                        prompt_tokens = int(response.prompt_tokens)
-                        prefill_tps = (
-                            prompt_tokens / (ttft_ms / 1000.0) if ttft_ms > 0 else 0.0
-                        )
-                        self._stats.note_ttft(ttft_ms, sanitise_float(prefill_tps))
-                        self._state("generating", "decode", None)
-
-                    last = now
-                    last_response = response
-                    gen_tokens = int(response.generation_tokens)
-                    prompt_tokens = int(response.prompt_tokens)
-                    self._stats.note_token(now)
-                    payload = TokenPayload(
-                        request=req.request,
-                        index=gen_tokens,
-                        text=response.text,
-                        ttsMs=monotonic_ms(started),
+            generator = stream_generate(model, tokenizer, prompt, max_tokens=max_tokens)
+            for response in generator:
+                now = time.perf_counter()
+                if progress.first is None:
+                    progress.first = now
+                    progress.ttft_ms = monotonic_ms(progress.started)
+                    progress.prompt_tokens = int(response.prompt_tokens)
+                    prefill_tps = (
+                        progress.prompt_tokens / (progress.ttft_ms / 1000.0)
+                        if progress.ttft_ms > 0
+                        else 0.0
                     )
-                    self._writer.send_event("token", payload.to_wire())
-                    if req.sink is not None:
-                        req.sink(
-                            {
-                                "kind": "token",
-                                "index": gen_tokens,
-                                "text": response.text,
-                            }
-                        )
+                    self._stats.note_ttft(progress.ttft_ms, sanitise_float(prefill_tps))
+                    self._state("generating", "decode", None)
+                    if max_tokens < 0:
+                        # This round's own prompt, not the request's first one.
+                        ceiling = self._context_window() - int(response.prompt_tokens)
 
-                    if self._cancelled(req.cancel_seq):
-                        finish_reason = "cancel"
-                        break
+                progress.last = now
+                progress.last_response = response
+                count = int(response.generation_tokens)
+                progress.gen_tokens = base + count
+                self._stats.note_token(now)
+                index = progress.gen_tokens
+                text = response.text
+                parts.append(text)
+                if emit:
+                    self._writer.send_event(
+                        "token",
+                        TokenPayload(
+                            request=req.request,
+                            index=index,
+                            text=text,
+                            ttsMs=monotonic_ms(progress.started),
+                        ).to_wire(),
+                    )
+                    if req.sink is not None:
+                        req.sink({"kind": "token", "index": index, "text": text})
                 else:
-                    raw = getattr(last_response, "finish_reason", None)
-                    finish_reason = raw if raw in ("length", "stop") else "length"
+                    buffered.append(
+                        {
+                            "request": req.request,
+                            "index": index,
+                            "text": text,
+                            "ttsMs": monotonic_ms(progress.started),
+                        }
+                    )
+
+                if self._cancelled(req.cancel_seq):
+                    finish_reason = "cancel"
+                    break
+                if ceiling is not None and progress.gen_tokens >= max(1, ceiling):
+                    # The model's own window, not its choice: it ran out of room.
+                    finish_reason = "length"
+                    break
+            else:
+                raw = getattr(progress.last_response, "finish_reason", None)
+                finish_reason = raw if raw in ("length", "stop") else "length"
         except Exception as exc:  # a real inference failure is a real record
             finish_reason = "error"
             error_message = f"{exc.__class__.__name__}: {exc}"
@@ -559,21 +701,53 @@ class Runner:
                 except Exception:
                     pass
 
-        total_ms = monotonic_ms(started)
+        return "".join(parts), finish_reason, error_message, buffered
+
+    def _emit_buffered(
+        self, req: _GenerateRequest, buffered: List[Dict[str, Any]]
+    ) -> None:
+        """Publish the round that turned out to be the answer."""
+        for payload in buffered:
+            self._writer.send_event("token", payload)
+            if req.sink is not None:
+                req.sink(
+                    {
+                        "kind": "token",
+                        "index": payload["index"],
+                        "text": payload["text"],
+                    }
+                )
+
+    def _record(
+        self,
+        req: _GenerateRequest,
+        progress: _Progress,
+        model_id: str,
+        finish_reason: str,
+    ) -> RequestRecord:
+        """The protocol record for one finished request, every round included."""
+        last_response = progress.last_response
         # PROTOCOL.md defines the per-request rate as (genTokens - 1) /
         # (t_last - t_first) over the token yields, so that is what is
         # reported; mlx-lm's own generation_tps is the fallback for the cases
         # where no interval exists (a single token, or a stream that failed).
         decode_tps = 0.0
-        if gen_tokens > 1 and first is not None and last is not None and last > first:
-            decode_tps = sanitise_float((gen_tokens - 1) / (last - first))
+        if (
+            progress.gen_tokens > 1
+            and progress.first is not None
+            and progress.last is not None
+            and progress.last > progress.first
+        ):
+            decode_tps = sanitise_float(
+                (progress.gen_tokens - 1) / (progress.last - progress.first)
+            )
         if decode_tps <= 0.0:
             decode_tps = sanitise_float(getattr(last_response, "generation_tps", 0.0) or 0.0)
         # Prefill is likewise pinned to the wall-clock TTFT definition, with
         # mlx-lm's prompt_tps used only when no TTFT could be measured.
         prefill_tps = (
-            sanitise_float(prompt_tokens / (ttft_ms / 1000.0))
-            if ttft_ms > 0 and prompt_tokens > 0
+            sanitise_float(progress.prompt_tokens / (progress.ttft_ms / 1000.0))
+            if progress.ttft_ms > 0 and progress.prompt_tokens > 0
             else sanitise_float(getattr(last_response, "prompt_tps", 0.0) or 0.0)
         )
         # Peak memory has no protocol formula; MLX's own high-water mark is the
@@ -582,19 +756,209 @@ class Runner:
         peak_bytes = (
             int(reported_peak * 1e9) if reported_peak > 0 else int(mx.get_peak_memory())
         )
-
-        record = RequestRecord(
+        return RequestRecord(
             request=req.request,
             model=model_id,
-            promptTokens=prompt_tokens,
-            genTokens=gen_tokens,
-            ttftMs=sanitise_float(ttft_ms),
+            promptTokens=progress.prompt_tokens,
+            genTokens=progress.gen_tokens,
+            ttftMs=sanitise_float(progress.ttft_ms),
             prefillTps=prefill_tps,
             decodeTps=decode_tps,
             peakMemBytes=peak_bytes,
-            startedAt=started_at,
-            totalMs=sanitise_float(total_ms),
-            finishReason=finish_reason or "length",
+            startedAt=progress.started_at,
+            totalMs=sanitise_float(monotonic_ms(progress.started)),
+            toolCalls=progress.tool_calls,
+            finishReason=finish_reason,
         )
+
+    def _begin(self, req: _GenerateRequest) -> _Progress:
+        with self._lock:
+            self._active_request = req.request
+        self._state("generating", "prefill", None)
+        return _Progress(started=req.submitted_perf, started_at=req.submitted_wall)
+
+    def _run_generation(self, req: _GenerateRequest) -> _Outcome:
+        if req.tools:
+            return self._run_with_tools(req)
+        return self._run_once(req)
+
+    def _run_once(self, req: _GenerateRequest) -> _Outcome:
+        """One plain generation: the prompt verbatim, no tool loop."""
+        model, tokenizer, model_id = self._model, self._tokenizer, self._loaded.model_id
+        if model is None or tokenizer is None or model_id is None:
+            raise BridgeError("no model loaded")
+
+        progress = self._begin(req)
+        finish_reason: Optional[str] = None
+        error_message: Optional[str] = None
+        if self._cancelled(req.cancel_seq):
+            # Cancelled between submit and start: never touch the model.
+            finish_reason = "cancel"
+        else:
+            # No `max_tokens` means no limit: `-1` streams until the model
+            # stops, bounded by `_stream_round` at the context window.
+            budget = req.max_tokens if req.max_tokens is not None else -1
+            _, finish_reason, error_message, _ = self._stream_round(
+                req, progress, req.prompt, budget, emit=True
+            )
+
+        record = self._record(req, progress, model_id, finish_reason or "length")
         return _Outcome(record=record, error=error_message)
+
+    def _run_with_tools(self, req: _GenerateRequest) -> _Outcome:
+        """The bounded tool loop: call, execute, feed back, generate again.
+
+        The tools are offered through the tokenizer's own chat template (see
+        `_render_tools_prompt`), and a result is fed back as a `tool` role
+        message, which is the shape those templates render for a tool response.
+
+        At most `TOOL_ROUNDS` rounds, and a round that asks for no tool *is* the
+        answer. Only that final round's text reaches the app as `token` events;
+        the scaffolding of a call round is never streamed as answer text, while
+        `tokensGenerated`, `toolCalls` and `totalMs` account for every round.
+        """
+        model, tokenizer, model_id = self._model, self._tokenizer, self._loaded.model_id
+        if model is None or tokenizer is None or model_id is None:
+            raise BridgeError("no model loaded")
+
+        progress = self._begin(req)
+        # No hand-written system message here: the chat template renders the
+        # tool definitions into the system turn itself. The written
+        # instructions are `_render_tools_prompt`'s fallback.
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": req.prompt}]
+        budget = req.max_tokens if req.max_tokens is not None else -1
+        finish_reason: Optional[str] = None
+        error_message: Optional[str] = None
+
+        for round_number in range(1, TOOL_ROUNDS + 1):
+            if self._cancelled(req.cancel_seq):
+                finish_reason = "cancel"
+                break
+            prompt = self._render_tools_prompt(messages)
+            text, round_finish, round_error, buffered = self._stream_round(
+                req, progress, prompt, budget, emit=False
+            )
+            if round_error is not None:
+                error_message = round_error
+                finish_reason = "error"
+                break
+            if round_finish == "cancel":
+                finish_reason = "cancel"
+                break
+
+            calls = parse_calls(text)
+            if not calls:
+                # No call: this round is the answer, and its tokens are the only
+                # ones the app sees.
+                finish_reason = round_finish
+                self._emit_buffered(req, buffered)
+                break
+
+            messages.append({"role": "assistant", "content": text})
+            interrupted = False
+            for call in calls:
+                if self._cancelled(req.cancel_seq):
+                    interrupted = True
+                    break
+                self._writer.send_event(
+                    "tool", _call_event(req.request, round_number, call)
+                )
+                result = self._tools.execute(call)
+                progress.tool_calls += 1
+                self._writer.send_event(
+                    "tool", _result_event(req.request, round_number, call, result)
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": call.name,
+                        "content": result.model_text(),
+                    }
+                )
+            if interrupted:
+                finish_reason = "cancel"
+                break
+        else:
+            # Every allowed round asked for a tool: the model never answered
+            # within the bound, so the request ends where it is.
+            finish_reason = "length"
+
+        record = self._record(req, progress, model_id, finish_reason or "length")
+        return _Outcome(record=record, error=error_message)
+
+    def _accepts_tools(self, tokenizer: Any) -> bool:
+        """Whether this tokenizer's chat template really renders `tools=`.
+
+        Probed once per load: the same message is rendered with and without the
+        schemas. A template that raises on the argument, renders nothing for it,
+        or silently ignores it (the two renders are identical) means the model
+        would never be told the tools, so the written instructions are used
+        instead.
+        """
+        if self._tools_template is None:
+            probe: List[Dict[str, Any]] = [{"role": "user", "content": "hi"}]
+            supported = False
+            reason = ""
+            try:
+                plain = tokenizer.apply_chat_template(
+                    probe, tokenize=False, add_generation_prompt=True
+                )
+                offered = tokenizer.apply_chat_template(
+                    probe,
+                    tools=tool_schemas(),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                if not isinstance(offered, str) or not offered.strip():
+                    reason = "its chat template rendered nothing for `tools=`"
+                elif offered == plain:
+                    reason = "its chat template ignores `tools=`"
+                else:
+                    supported = True
+            except Exception as exc:
+                reason = f"its chat template raised on `tools=` ({exc})"
+            if not supported:
+                self._writer.log(
+                    "info", f"{reason}; using the written tool instructions instead"
+                )
+            self._tools_template = supported
+        return self._tools_template
+
+    def _apply_template(
+        self, tokenizer: Any, messages: List[Dict[str, Any]], **extra: Any
+    ) -> Optional[str]:
+        """The chat template's rendering, or None when it will not render."""
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, **extra
+            )
+        except Exception:
+            return None
+        if isinstance(rendered, str) and rendered.strip():
+            return rendered
+        return None
+
+    def _render_tools_prompt(self, messages: List[Dict[str, Any]]) -> str:
+        """The tool loop's prompt.
+
+        The primary path is the tokenizer's own chat template with the tools
+        offered in the shape it expects, which is what makes these models emit a
+        real call instead of narrating one. A tokenizer whose template rejects
+        `tools=`, or that has no chat template at all, gets PROTOCOL.md's
+        hand-written instructions instead — as a chat rendering when it can, and
+        otherwise as a plain transcript.
+        """
+        tokenizer = self._tokenizer
+        if tokenizer is not None and getattr(tokenizer, "has_chat_template", False):
+            if self._accepts_tools(tokenizer):
+                rendered = self._apply_template(tokenizer, messages, tools=tool_schemas())
+                if rendered is not None:
+                    return rendered
+            system = [{"role": "system", "content": self._tools.system_prompt()}]
+            rendered = self._apply_template(tokenizer, system + messages)
+            if rendered is not None:
+                return rendered
+        return _plain_transcript(
+            [{"role": "system", "content": self._tools.system_prompt()}] + messages
+        )
 

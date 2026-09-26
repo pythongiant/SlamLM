@@ -136,10 +136,12 @@ class Bridge:
             return {
                 "request": self.runner.submit(
                     message.get("prompt"),
+                    # Absent, null and any falsy junk all mean no limit.
                     message.get("max_tokens"),
                     request_id,
                     # Absent, null and any falsy junk all mean the raw prompt.
                     chat=bool(message.get("chat") or False),
+                    tools=bool(message.get("tools") or False),
                 )
             }
         if command == "cancel":

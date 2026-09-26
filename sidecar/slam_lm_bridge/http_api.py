@@ -20,7 +20,8 @@ from typing import Any, Callable, Dict, List, Optional
 from .protocol import BRIDGE_NAME, HTTP_REQUEST_BASE
 from .runner import BridgeError
 
-DEFAULT_MAX_TOKENS = 256
+#: A client that asks for more than this gets this much: a cap on an explicit
+#: request, never a default for a request that named no budget.
 MAX_MAX_TOKENS = 4096
 
 
@@ -63,12 +64,13 @@ def normalise_messages(raw: Any) -> List[Dict[str, Any]]:
     return messages
 
 
-def _max_tokens(body: Dict[str, Any]) -> int:
+def _max_tokens(body: Dict[str, Any]) -> Optional[int]:
+    """PROTOCOL.md: an absent `max_tokens` is no limit, not a budget."""
     raw = body.get("max_tokens")
     if raw is None:
         raw = body.get("max_completion_tokens")
     if raw is None:
-        return DEFAULT_MAX_TOKENS
+        return None
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -265,11 +267,12 @@ def _make_handler(api: HttpApi) -> type:
             if runner.loaded_model_id is None:
                 raise HttpApiError(503, "no model is loaded", "server_error")
 
-            # Only prompt shape, token budget and `stream` are honoured; sampling
-            # knobs (`temperature`, `top_p`, …) are not plumbed through to mlx-lm,
-            # so generation runs with mlx-lm's own default sampler.
+            # Only prompt shape, token budget, `tools` and `stream` are honoured;
+            # sampling knobs (`temperature`, `top_p`, …) are not plumbed through
+            # to mlx-lm, so generation runs with mlx-lm's own default sampler.
             stream = bool(body.get("stream") or False)
             max_tokens = _max_tokens(body)
+            tools = bool(body.get("tools") or False)
 
             if path == "/v1/chat/completions":
                 messages = normalise_messages(body.get("messages"))
@@ -288,7 +291,9 @@ def _make_handler(api: HttpApi) -> type:
             request_id = api.next_request_id()
             sink: "queue.Queue[Dict[str, Any]]" = queue.Queue()
             try:
-                runner.submit(prompt, max_tokens, request_id, sink=sink.put_nowait)
+                runner.submit(
+                    prompt, max_tokens, request_id, sink=sink.put_nowait, tools=tools
+                )
             except BridgeError as exc:
                 status = 503 if "no model" in str(exc) else 400
                 raise HttpApiError(status, str(exc), "server_error") from None

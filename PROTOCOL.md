@@ -33,7 +33,7 @@ Replies may interleave with events. `result` is `{}` when a command returns noth
 | `catalog` | — | `{"models":[Model,…]}` — rescans the local model stores |
 | `load` | `model:String` | `{"model":String,"loadMs":Float,"memoryBytes":Int}` |
 | `unload` | — | `{}` — frees the model and empties the MLX cache |
-| `generate` | `prompt:String`, `max_tokens:Int`, `request:Int`, `chat:Bool` | `{"request":Int}` immediately; output arrives as `token` events, terminated by `request_end` |
+| `generate` | `prompt:String`, `max_tokens:Int?`, `request:Int`, `chat:Bool`, `tools:Bool` | `{"request":Int}` immediately; output arrives as `token` events, terminated by `request_end` |
 | `cancel` | — | `{"cancelled":Bool}` |
 | `serve` | `port:Int` | `{"port":Int,"url":String}` — start the OpenAI-compatible HTTP API (idempotent) |
 | `stop_serve` | — | `{"stopped":Bool}` |
@@ -50,6 +50,70 @@ continue. Without `chat` (or with any falsey value) the prompt is generated
 verbatim, which is what prefill/throughput measurement wants. A model whose
 tokenizer has no chat template falls back to the message content unchanged.
 
+`max_tokens` is optional and there is no user-facing token budget: a request
+without it generates until the model stops on its own, and the only ceiling is the
+model's context window (its `max_position_embeddings` minus the prompt, or 4096
+when the config does not say). A caller that passes `max_tokens` gets exactly that
+budget — the HTTP API honours the OpenAI field, and `--tokens` uses it to keep a
+documentation capture short.
+
+`generate` with `tools: true` lets the model call the read-only tools below before
+it answers. The loop is bounded: at most `TOOL_ROUNDS` (4) rounds of
+call → execute → continue, then whatever the model has produced is the answer.
+Each round is a generation inside the same request, so `ttftMs` covers the first
+round and `toolCalls` in the `request_end` record counts executions. Tool use is
+reported as it happens with a `tool` event, which is what the panel renders as a
+trace — a tool the model asked for is never executed silently.
+
+**A `tool` event has one of two shapes**, in order:
+
+```jsonc
+{"event":"tool","data":{"request":3,"round":1,"phase":"call","name":"web_search",
+                        "arguments":{"query":"mlx benchmarks"},"ok":true,
+                        "summary":"web_search(\"mlx benchmarks\")","detail":null}}
+{"event":"tool","data":{"request":3,"round":1,"phase":"result","name":"web_search",
+                        "arguments":null,"ok":true,"summary":"5 results",
+                        "detail":"1. …\n2. …"}}
+```
+
+`ok:false` on a result means the tool failed (a refused path, a network error, a
+timeout); the message is in `summary`/`detail` and is fed back to the model, so a
+failure becomes something it can react to rather than a dead end.
+
+**Tools the model may call.** All are read-only; there is deliberately no write,
+edit, move, delete or shell tool:
+
+| tool | arguments | returns |
+|---|---|---|
+| `web_search` | `query:String`, `max_results:Int = 5` | `{results:[{title,url,snippet}]}` |
+| `read_file` | `path:String`, `max_bytes:Int = 20000` | `{path,bytes,text}` (truncated at `max_bytes`) |
+| `list_directory` | `path:String` | `{path,entries:[{name,kind,bytes,modified}]}` |
+| `search_files` | `pattern:String`, `path:String = "."` | `{matches:[paths]}`, recursive, capped at 200 |
+| `file_info` | `path:String` | `{path,kind,bytes,modified}` |
+
+**How the model is told about them.** The tools are handed to the model through
+its own chat template — `apply_chat_template(messages, tools=[…])`, with the tools
+in the OpenAI/`vLLM` shape (`{"type":"function","function":{"name","description","parameters"}}`)
+— because that is the format the model was trained on. Measured on
+`Qwen3-0.6B-4bit` and `Qwen3-1.7B-4bit`: given the template's tool block, both emit
+a real call; given only a hand-written system message describing the same tools,
+both instead narrate *"I'll use the web_search tool … the first result says …"*
+and fabricate results. A model whose template rejects `tools=` (or has no chat
+template) falls back to a system message describing the same format.
+
+Results go back as standard `{"role": "tool", "content": …}` messages appended to
+the conversation, which the template renders and the model answers from.
+
+The bridge accepts a call in either spelling the models use: their own
+`<tool_call>{"name": …, "arguments": {…}}</tool_call>` tag, or a fenced block
+tagged `tool` containing the same JSON (` ```tool ` … ` ``` `), since some models
+prefer fences to tags. Anything else is treated as the answer.
+
+**Path policy.** File tools resolve symlinks and refuse any path outside the
+configured root — `SLAM_LM_TOOL_ROOT`, defaulting to the home directory — returning
+`ok:false` rather than reading it. Search and listing are likewise confined.
+Nothing is written, anywhere.
+
 ## Events (bridge → app)
 
 | `event` | `data` | cadence |
@@ -57,6 +121,7 @@ tokenizer has no chat template falls back to the message content unchanged.
 | `metrics` | `LiveMetrics` | 5 Hz, always (memory fields are valid with no model loaded) |
 | `state` | `{"status":Status,"phase":Phase,"model":String?,"message":String?}` | on every transition |
 | `token` | `{"request":Int,"index":Int,"text":String,"ttsMs":Float}` | per generated token |
+| `tool` | `{"request":Int,"round":Int,"phase":"call"\|"result","name":String,"arguments":Object?,"ok":Bool,"summary":String,"detail":String?}` | on every tool call and its result, with `tools: true` |
 | `request_end` | `RequestRecord` | once per request, including on `cancel` and on error (`finish_reason:"error"`) |
 | `log` | `{"level":"info"\|"warn"\|"error","message":String}` | as needed; surfaced in the app's log strip |
 
@@ -141,6 +206,7 @@ separate GPU memory to report.
   "peakMemBytes": 1868000000,
   "startedAt": 1758700000.123,
   "totalMs": 1690.4,
+  "toolCalls": 0,          // tools executed for this request
   "finishReason": "length" // "length"|"stop"|"cancel"|"error"
 }
 ```
@@ -273,7 +339,7 @@ The app accepts, for development and verification:
 | `--snapshot <path.png>` | render the panel offscreen to a PNG at 2x and exit 0 |
 | `--snapshot-analytics <path.png>` | same, with the analytics tab open |
 | `--model <id>` | model the snapshot modes load before rendering (default: the first catalog entry) |
-| `--tokens <n>` | generated tokens for the snapshot's real request (default 64) |
+| `--tokens <n>` | token budget for the snapshot's request; absent means no budget, so the run ends when the model stops |
 | `--requests <n>` | real runs `--snapshot-analytics` drives before rendering (default 1; 3 makes the per-request throughput chart meaningful) |
 | `--prompt <text>` | overrides the built-in snapshot prompt, to capture a particular shape of output |
 | `--load` | with a plain `--snapshot`, load the model first so the captured panel shows the running state |
@@ -285,10 +351,10 @@ The app accepts, for development and verification:
 `--snapshot <path>` renders the picker with the real catalog and live memory, and
 exits. `--snapshot-analytics <path>` must additionally *drive* the run itself,
 because nothing else will: load the `--model` (or first catalog) model, start
-`serve`, wait for the load to report ready, send one real prompt of `--tokens`
-tokens over the bridge, wait for `request_end`, and only then render. Both modes
-must fail loudly (nonzero exit, message on stderr) rather than render a panel with
-fabricated numbers if real data never arrives.
+`serve`, wait for the load to report ready, send one real prompt over the bridge
+(bounded by `--tokens` when given), wait for `request_end`, and only then render.
+Both modes must fail loudly (nonzero exit, message on stderr) rather than render a
+panel with fabricated numbers if real data never arrives.
 
 ## File ownership
 
