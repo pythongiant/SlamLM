@@ -34,7 +34,7 @@ APP="$HERE/build/SlamLM.app"
 BIN_NAME="SlamLM"
 PYTHON="${SLAM_LM_PYTHON:-$REPO/.venv/bin/python}"
 MODEL="${SLAM_LM_SNAPSHOT_MODEL:-mlx-community/Qwen3-0.6B-4bit}"
-TOKENS="${SLAM_LM_SNAPSHOT_TOKENS:-96}"
+TOKENS="${SLAM_LM_SNAPSHOT_TOKENS:-400}"
 REQUESTS="${SLAM_LM_SNAPSHOT_REQUESTS:-3}"
 # The tools capture needs a model that grounds its answer in what the tool
 # returned; the small default is fast but unreliable at that, and a capture that

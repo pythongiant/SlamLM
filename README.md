@@ -70,9 +70,10 @@ behind a disclosure, so the answer is the thing you read.
   explore your files before answering, and the panel shows every call it made. There is
   no write, edit, move, delete or shell tool, and file access is confined to the root in
   `SLAM_LM_TOOL_ROOT` (your home directory by default).
-- **No token budget to set** — a request runs until the model stops on its own. The only
-  ceiling is the model's context window, so answers are not truncated mid-sentence by a
-  number you have to remember to raise.
+- **No token budget to set** — a request runs until the model stops on its own, so
+  answers are not truncated by a number you have to remember to raise. A 2048-token
+  safeguard per round stops a model that never emits its stop token from generating
+  for minutes and pushing the machine into swap; `SLAM_LM_MAX_TOKENS` changes it.
 - **Chat templating** — prompts go through the model's own chat template, the same path
   the HTTP endpoint uses.
 - **Keyboard and VoiceOver friendly** — every control is labelled; `⌘K` focuses search.

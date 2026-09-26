@@ -79,7 +79,11 @@ struct AnalyticsView: View {
             if let url = metrics.servingURL {
                 EndpointCard(url: url)
             }
-            LastOutputCard(text: metrics.streamText, toolEvents: metrics.toolEvents)
+            LastOutputCard(
+                text: metrics.streamText,
+                toolEvents: metrics.toolEvents,
+                stoppedAtLimit: metrics.requests.first?.finishReason == "length"
+            )
         }
         .padding(.horizontal, AnalyticsLayout.contentPadding)
         .padding(.vertical, AnalyticsLayout.contentPadding)
@@ -749,6 +753,11 @@ private struct LastOutputCard: View {
     let text: String
     /// Tool calls and results for the request that produced this output.
     let toolEvents: [ToolEvent]
+    /// The newest request stopped at a limit rather than finishing on its own.
+    /// A model can spend an entire budget reasoning and produce no answer at
+    /// all; saying so is the difference between "still working" and "it is not
+    /// going to answer".
+    let stoppedAtLimit: Bool
 
     var body: some View {
         PaperCard(fill: Paper.card) {
@@ -756,6 +765,9 @@ private struct LastOutputCard: View {
                 HStack(spacing: 6) {
                     SectionLabel(text: "Last output")
                     Spacer(minLength: 4)
+                    if stoppedAtLimit {
+                        TagPill(text: "stopped at the limit", fill: Paper.washClay, ink: Paper.clayInk)
+                    }
                     if !text.isEmpty {
                         TagPill(text: "\(text.count) chars")
                     }
@@ -764,6 +776,12 @@ private struct LastOutputCard: View {
                     EmptyState(symbol: "text.alignleft", title: "No output yet",
                                detail: "Tokens streamed for the most recent request appear here.")
                 } else {
+                    if stoppedAtLimit {
+                        Text("The model ran out of room before it answered: the per-round token limit, or the tool rounds. What it produced is below.")
+                            .font(PaperFont.meta)
+                            .foregroundStyle(Paper.clayInk)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     ToolTrace(events: toolEvents)
                     MarkdownText(raw: text)
                         .frame(maxWidth: .infinity, alignment: .leading)
