@@ -99,7 +99,7 @@ struct MarkdownDocument {
             flushParagraph(); flushBullets(); flushNumbers(); flushQuote()
         }
 
-        var lines = text.components(separatedBy: .newlines)
+        let lines = text.components(separatedBy: .newlines)
         var index = 0
         while index < lines.count {
             let line = lines[index]

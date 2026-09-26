@@ -92,7 +92,22 @@ final class ModelStore: ObservableObject {
 
     /// Send one prompt through the loaded model. Output arrives as `token`
     /// events into `bus.streamText`, then as a `request_end` record.
-    func send(prompt: String, maxTokens: Int) {
+    /// Request fields for one generation. `max_tokens` is only included when one
+    /// was asked for, so the bridge's own ceiling applies otherwise.
+    private func generateFields(prompt: String, request: Int, maxTokens: Int?) -> [String: Any] {
+        var fields: [String: Any] = [
+            "prompt": prompt,
+            "request": request,
+            "chat": true,
+            "tools": bus.toolsEnabled
+        ]
+        if let maxTokens { fields["max_tokens"] = maxTokens }
+        return fields
+    }
+
+    /// `maxTokens` is only used by the snapshot tooling to keep a capture short;
+    /// the panel sends none, so a request runs until the model stops.
+    func send(prompt: String, maxTokens: Int? = nil) {
         guard !bus.busy else { return }
         guard loadedModelID != nil else {
             bus.errorText = "Load a model before sending a prompt."
@@ -108,7 +123,7 @@ final class ModelStore: ObservableObject {
             // bridge renders it through the model's own chat template — the same
             // path the HTTP endpoint uses.
             "generate",
-            fields: ["prompt": prompt, "max_tokens": maxTokens, "request": request, "chat": true],
+            fields: generateFields(prompt: prompt, request: request, maxTokens: maxTokens),
             expecting: GenerateAck.self
         ) { [weak self] result in
             guard let self else { return }

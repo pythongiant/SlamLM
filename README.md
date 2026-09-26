@@ -66,6 +66,13 @@ behind a disclosure, so the answer is the thing you read.
 - **Real memory** — machine-wide memory in Activity Monitor's terms, not just this
   process's footprint, because on Apple silicon there is one unified pool.
 - **Markdown output** — headings, lists, tables, quotes and code, in the app's palette.
+- **Tools, read-only** — with the Tools switch on, the model can search the web and
+  explore your files before answering, and the panel shows every call it made. There is
+  no write, edit, move, delete or shell tool, and file access is confined to the root in
+  `SLAM_LM_TOOL_ROOT` (your home directory by default).
+- **No token budget to set** — a request runs until the model stops on its own. The only
+  ceiling is the model's context window, so answers are not truncated mid-sentence by a
+  number you have to remember to raise.
 - **Chat templating** — prompts go through the model's own chat template, the same path
   the HTTP endpoint uses.
 - **Keyboard and VoiceOver friendly** — every control is labelled; `⌘K` focuses search.
@@ -74,6 +81,47 @@ behind a disclosure, so the answer is the thing you read.
 <img src="docs/picker.png" width="392" alt="The picker with Qwen3 1.7B loaded and serving: the row reads Running, the footer shows the endpoint and system memory">
 <sub>A model running: the row reads <i>Running</i>, and the footer carries the endpoint and the machine's memory.</sub>
 </div>
+
+## Tools
+
+The switch next to the prompt lets the model reach outside its weights before it
+answers. Every call appears in the panel — what was asked, whether it worked, and
+what came back — so an answer that cites the web or one of your files shows its
+work.
+
+<div align="center">
+<img src="docs/tools.png" width="648" alt="The panel showing two tool calls — a directory listing and a file read — above the model's answer">
+<sub>Two tool calls above the answer: what was asked, whether it worked, and what came back.</sub>
+</div>
+
+| tool | what it does |
+|---|---|
+| `web_search` | keyless web search (DuckDuckGo); returns titles, URLs and snippets |
+| `read_file` | reads a text file, truncated to a byte budget |
+| `list_directory` | one directory's entries with kind, size and modification time |
+| `search_files` | recursive glob, capped at 200 matches |
+| `file_info` | kind, size and modification time for one path |
+
+All five are read-only. There is deliberately **no** write, edit, move, delete or
+shell tool, and file access resolves symlinks and refuses anything outside the
+tool root — `SLAM_LM_TOOL_ROOT`, your home directory by default:
+
+```sh
+SLAM_LM_TOOL_ROOT=~/work bash build.sh   # narrower root, recorded at build time
+```
+
+The loop is bounded: at most four rounds of call → execute → continue, and the run
+ends as soon as the model answers without calling a tool. A refused path or a failed
+request is handed back to the model as an error it can react to, never swallowed.
+
+**What leaves the machine:** a `web_search` query, and nothing else — the model
+itself is local. Turn the switch off and there is no network access at all.
+
+Search is keyless: the bridge tries DuckDuckGo's HTML endpoint, its lite endpoint
+and Brave, in that order, and names which one answered. If every provider refuses —
+search engines rate-limit by IP, and a session of heavy use will hit that — the tool
+reports each refusal verbatim and hands that back to the model, rather than returning
+nothing and letting it invent an answer.
 
 ## Requirements
 
@@ -153,7 +201,8 @@ Then open the gear menu in the panel and choose **Refresh catalog**.
 | **Open the panel** | Click the brain icon in the menu bar. `bash build.sh run` opens the same panel in a window. |
 | **Run a model** | Press the play button on a row. The row shows *Running*, the header shows the loaded model, and the endpoint starts. |
 | **Stop it** | Press the same button again — the model is unloaded and the MLX buffer cache is freed. |
-| **Generate** | Open the analytics tab, type into the prompt box and press **Run**. Output streams into *Last output*. |
+| **Generate** | Open the analytics tab, type into the prompt box and press **Run**. Output streams into *Last output*, and the run continues until the model stops. |
+| **Let it use tools** | The **Tools** switch in the prompt row. On: the model may search the web and read files, and each call is listed above the answer. Off: it answers from its weights alone. |
 | **Quit** | Gear menu → *Quit SlamLM* (it is a menu bar app, so there is no Dock icon). |
 
 ### Use the endpoint from anything
@@ -170,9 +219,10 @@ curl -X POST http://127.0.0.1:8712/v1/chat/completions \
 ```
 
 Streaming works too (`"stream": true`), as does `/v1/completions`. Point any
-OpenAI-compatible client at `http://127.0.0.1:8712/v1`. Requests from other clients are
-measured alongside the panel's own, so the charts fill in as your tools use the model.
-`GET /metrics` returns the raw numbers behind the board.
+OpenAI-compatible client at `http://127.0.0.1:8712/v1`. A request may set `max_tokens`
+(absent means no budget) and `tools: true` to let the model call the tools above.
+Requests from other clients are measured alongside the panel's own, so the charts fill
+in as your tools use the model. `GET /metrics` returns the raw numbers behind the board.
 
 ## How it works
 
@@ -181,6 +231,7 @@ flowchart LR
   UI["Menu bar panel<br/>SwiftUI · MenuBarExtra"] -- "newline-delimited JSON<br/>over stdio" --> BR["Python bridge<br/>mlx-lm driver"]
   BR -- "load · stream_generate" --> MLX["MLX on Metal"]
   BR -- "OpenAI API on 127.0.0.1:8712" --> YOU["your tools"]
+  BR -- "read-only tools<br/>web search · your files" --> EXT["the web · your disk"]
   BR -- "host_statistics64 · sysctl" --> SYS["machine memory"]
   UI -- "spawns and supervises" --> BR
 ```

@@ -93,7 +93,7 @@ struct PanelView: View {
     /// The panel owns the tab, so it supplies the way back to the picker.
     private var analyticsActions: AnalyticsActions {
         AnalyticsActions(
-            send: { prompt, maxTokens in store.send(prompt: prompt, maxTokens: maxTokens) },
+            send: { prompt in store.send(prompt: prompt) },
             cancel: { store.cancel() },
             showModels: { tab = .models }
         )

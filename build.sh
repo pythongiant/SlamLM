@@ -15,8 +15,14 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The app is the repository root in this checkout.
-REPO="$HERE"
+# The app lives at `menubar/` inside a source tree and at the repository root when
+# published, so the checkout is the directory that holds the interpreter: beside
+# these sources first, otherwise the parent that has `.venv`.
+if [[ -x "$HERE/.venv/bin/python" ]]; then
+    REPO="$HERE"
+else
+    REPO="$(cd "$HERE/.." && pwd)"
+fi
 CMD="${1:-build}"
 CONFIG="release"
 if [[ "$CMD" == "debug" ]]; then
@@ -30,6 +36,10 @@ PYTHON="${SLAM_LM_PYTHON:-$REPO/.venv/bin/python}"
 MODEL="${SLAM_LM_SNAPSHOT_MODEL:-mlx-community/Qwen3-0.6B-4bit}"
 TOKENS="${SLAM_LM_SNAPSHOT_TOKENS:-96}"
 REQUESTS="${SLAM_LM_SNAPSHOT_REQUESTS:-3}"
+# The tools capture needs a model that grounds its answer in what the tool
+# returned; the small default is fast but unreliable at that, and a capture that
+# shows the model ignoring its own tool result is worse than none.
+TOOLS_MODEL="${SLAM_LM_SNAPSHOT_TOOLS_MODEL:-mlx-community/Qwen3-1.7B-4bit}"
 
 bundle() {
     echo "==> swift build -c $CONFIG"
@@ -84,7 +94,9 @@ case "$CMD" in
         ;;
     capture)
         bundle
-        OUT="$HERE/build/captures"
+        # `docs/` holds the README's images, so refresh them in place when it
+        # exists; a source tree without one gets the scratch directory.
+        if [[ -d "$REPO/docs" ]]; then OUT="$REPO/docs"; else OUT="$HERE/build/captures"; fi
         mkdir -p "$OUT"
         echo "==> capturing picker"
         "$APP/Contents/MacOS/$BIN_NAME" --snapshot "$OUT/picker.png" \
@@ -92,6 +104,14 @@ case "$CMD" in
         echo "==> capturing analytics (drives $REQUESTS real ${TOKENS}-token runs on $MODEL)"
         "$APP/Contents/MacOS/$BIN_NAME" --snapshot-analytics "$OUT/analytics.png" \
             --model "$MODEL" --tokens "$TOKENS" --requests "$REQUESTS"
+        # The tool trace, driven by the file tools so the capture stays offline
+        # and repeatable: a directory listing and a read of a source file.
+        echo "==> capturing tools (file tools against $REPO)"
+        # A reasoning model spends a lot of the budget thinking before it calls
+        # anything: at 900 tokens Qwen3 1.7B never reached the tool call.
+        "$APP/Contents/MacOS/$BIN_NAME" --snapshot-analytics "$OUT/tools.png" \
+            --model "$TOOLS_MODEL" --tokens 2600 --requests 1 \
+            --prompt "Use list_directory on $REPO, then read $REPO/Package.swift and tell me the package name and its targets."
         ls -l "$OUT"
         ;;
     *)

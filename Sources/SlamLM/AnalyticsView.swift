@@ -20,7 +20,6 @@ struct AnalyticsView: View {
     let actions: AnalyticsActions
 
     @State private var prompt = ""
-    @State private var maxTokens = 64
     /// Set only by the picker surface while it rasterises a snapshot offscreen.
     @Environment(\.renderStaticSnapshot) private var renderStatic
 
@@ -69,17 +68,18 @@ struct AnalyticsView: View {
             }
             PromptComposer(
                 prompt: $prompt,
-                maxTokens: $maxTokens,
                 modelName: metrics.selected?.name,
                 canRun: canRun,
                 canCancel: canCancel,
+                toolsEnabled: metrics.toolsEnabled,
                 onRun: run,
-                onCancel: { actions.cancel() }
+                onCancel: { actions.cancel() },
+                onToggleTools: { metrics.toolsEnabled.toggle() }
             )
             if let url = metrics.servingURL {
                 EndpointCard(url: url)
             }
-            LastOutputCard(text: metrics.streamText)
+            LastOutputCard(text: metrics.streamText, toolEvents: metrics.toolEvents)
         }
         .padding(.horizontal, AnalyticsLayout.contentPadding)
         .padding(.vertical, AnalyticsLayout.contentPadding)
@@ -131,7 +131,7 @@ struct AnalyticsView: View {
     private var canCancel: Bool { metrics.status == .generating }
 
     private func run() {
-        actions.send(prompt, maxTokens)
+        actions.send(prompt)
     }
 }
 
@@ -628,12 +628,13 @@ private struct TTFTCard: View {
 
 private struct PromptComposer: View {
     @Binding var prompt: String
-    @Binding var maxTokens: Int
     let modelName: String?
     let canRun: Bool
     let canCancel: Bool
+    let toolsEnabled: Bool
     let onRun: () -> Void
     let onCancel: () -> Void
+    let onToggleTools: () -> Void
 
     @Environment(\.renderStaticSnapshot) private var renderStatic
 
@@ -650,7 +651,7 @@ private struct PromptComposer: View {
                 }
                 HStack(spacing: 8) {
                     promptField
-                    MaxTokensStepper(value: $maxTokens)
+                    ToolsSwitch(enabled: toolsEnabled, action: onToggleTools)
                     PaperButton(title: "Run", symbol: "play.fill", style: .primary,
                                 enabled: canRun, action: onRun)
                     PaperButton(title: "Cancel", symbol: "stop.fill", style: .ghost,
@@ -691,45 +692,34 @@ private struct PromptComposer: View {
     }
 }
 
-/// 8…512 token budget, stepped in eighths so the range is traversed quickly.
-private struct MaxTokensStepper: View {
-    @Binding var value: Int
-    private let bounds = 8...512
-    private let step = 8
+/// Lets the model call the read-only tools. A switch rather than a checkbox so
+/// it reads at a glance, and it carries the state rather than hiding it in a menu.
+private struct ToolsSwitch: View {
+    let enabled: Bool
+    let action: () -> Void
 
     var body: some View {
-        HStack(spacing: 2) {
-            GlyphButton(symbol: "minus", diameter: 22, glyphSize: 9) {
-                value = max(bounds.lowerBound, value - step)
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: enabled ? "wrench.and.screwdriver.fill" : "wrench.and.screwdriver")
+                    .font(.system(size: 9, weight: .semibold))
+                Text("Tools")
+                    .font(.system(size: 11, weight: .semibold))
             }
-            // Labelled as a budget: this is the max_tokens for the next Run, not
-            // a count of tokens already generated.
-            HStack(spacing: 3) {
-                Text("MAX")
-                    .font(.system(size: 7.5, weight: .semibold))
-                    .tracking(0.7)
-                    .foregroundStyle(Paper.inkFaint)
-                Text("\(value)")
-                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(Paper.ink)
-            }
-            .frame(minWidth: 46)
-            GlyphButton(symbol: "plus", diameter: 22, glyphSize: 9) {
-                value = min(bounds.upperBound, value + step)
-            }
+            .foregroundStyle(enabled ? Paper.accentInk : Paper.inkSoft)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(enabled ? Paper.accent : Paper.card))
+            .overlay(Capsule().strokeBorder(enabled ? .clear : Paper.stroke, lineWidth: 1))
         }
-        .padding(.horizontal, 4)
-        .padding(.vertical, 3)
-        .background(Capsule().fill(Paper.card))
-        .overlay(Capsule().strokeBorder(Paper.stroke, lineWidth: 1))
-        .help("Max tokens for the next run, \(bounds.lowerBound)–\(bounds.upperBound)")
+        .buttonStyle(.plain)
+        .help(enabled
+              ? "The model may search the web and read files (read-only) before answering"
+              : "Tools off: the model answers from its own weights")
+        .accessibilityLabel(Text(enabled ? "Disable tools" : "Enable tools"))
     }
 }
 
-// MARK: - Endpoint
-
-/// The OpenAI-compatible surface, shown only while `serve` is active.
 private struct EndpointCard: View {
     let url: String
 
@@ -757,6 +747,8 @@ private struct EndpointCard: View {
 
 private struct LastOutputCard: View {
     let text: String
+    /// Tool calls and results for the request that produced this output.
+    let toolEvents: [ToolEvent]
 
     var body: some View {
         PaperCard(fill: Paper.card) {
@@ -772,6 +764,7 @@ private struct LastOutputCard: View {
                     EmptyState(symbol: "text.alignleft", title: "No output yet",
                                detail: "Tokens streamed for the most recent request appear here.")
                 } else {
+                    ToolTrace(events: toolEvents)
                     MarkdownText(raw: text)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }

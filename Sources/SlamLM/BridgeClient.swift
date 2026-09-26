@@ -284,6 +284,9 @@ final class BridgeClient {
             // its tokens must not show up as the app's own output.
             guard payload.data.request == appStreamRequest else { return }
             bus.streamText += payload.data.text
+        case "tool":
+            guard let payload = decode(WireEvent<ToolEvent>.self, from: line) else { return }
+            bus.ingest(payload.data)
         case "request_end":
             guard let payload = decode(WireEvent<RequestRecord>.self, from: line) else { return }
             bus.ingest(payload.data)

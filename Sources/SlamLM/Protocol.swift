@@ -97,6 +97,7 @@ struct RequestRecord: Codable, Identifiable, Hashable {
     let peakMemBytes: Int
     let startedAt: Double
     let totalMs: Double
+    let toolCalls: Int
     let finishReason: String
 
     var id: Int { request }
@@ -145,6 +146,92 @@ struct LogPayload: Codable {
     let message: String
 }
 
+/// One tool call or its result. A call carries the arguments the model asked
+/// with; a result carries what came back. `ok` is false for a refusal or a
+/// failure, which the model is shown rather than swallowed.
+struct ToolEvent: Codable, Identifiable, Hashable {
+    let request: Int
+    let round: Int
+    let phase: String
+    let name: String
+    let arguments: ToolArguments?
+    let ok: Bool
+    let summary: String
+    let detail: String?
+
+    var id: String { "\(request)-\(round)-\(phase)-\(name)" }
+    var isCall: Bool { phase == "call" }
+    var failed: Bool { !ok }
+}
+
+/// Tool arguments arrive as an arbitrary JSON object. The panel only ever shows
+/// them, so each value is flattened to display text here rather than pulling a
+/// JSON value type through the whole app.
+struct ToolArguments: Codable, Hashable {
+    let pairs: [(String, String)]
+
+    /// Only decoding constructs these in the app; this exists so tests and
+    /// offscreen harnesses can build one.
+    init(pairs: [(String, String)]) { self.pairs = pairs }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: DynamicKey.self)
+        pairs = try container.allKeys
+            .map { ($0.stringValue, try container.decode(AnyJSONText.self, forKey: $0).text) }
+            .sorted { $0.0 < $1.0 }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: DynamicKey.self)
+        for (key, value) in pairs {
+            try container.encode(value, forKey: DynamicKey(stringValue: key)!)
+        }
+    }
+
+    /// `key: value, key: value`, for a one-line caption.
+    var summary: String { pairs.map { "\($0.0): \($0.1)" }.joined(separator: ", ") }
+
+    static func == (lhs: ToolArguments, rhs: ToolArguments) -> Bool {
+        lhs.pairs.elementsEqual(rhs.pairs, by: { $0.0 == $1.0 && $0.1 == $1.1 })
+    }
+
+    func hash(into hasher: inout Hasher) {
+        for pair in pairs { hasher.combine(pair.0); hasher.combine(pair.1) }
+    }
+}
+
+/// Display text for any JSON value: strings as themselves, everything else in
+/// compact JSON form. Recursive, so nested objects and arrays survive.
+struct AnyJSONText: Decodable {
+    let text: String
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(String.self) { text = value; return }
+        if let value = try? container.decode(Bool.self) { text = value ? "true" : "false"; return }
+        if let value = try? container.decode(Int.self) { text = String(value); return }
+        if let value = try? container.decode(Double.self) { text = String(value); return }
+        if container.decodeNil() { text = "null"; return }
+        if let values = try? container.decode([AnyJSONText].self) {
+            text = "[" + values.map(\.text).joined(separator: ", ") + "]"
+            return
+        }
+        let keyed = try decoder.container(keyedBy: DynamicKey.self)
+        let parts = try keyed.allKeys.map { key -> String in
+            let value = try keyed.decode(AnyJSONText.self, forKey: key)
+            return "\(key.stringValue): \(value.text)"
+        }
+        text = "{" + parts.joined(separator: ", ") + "}"
+    }
+}
+
+struct DynamicKey: CodingKey {
+    let stringValue: String
+    var intValue: Int? { nil }
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { nil }
+}
+
 /// Reply envelope: `{"id":Int,"ok":Bool,"result":{…}}` or `{"id":Int,"ok":Bool,"error":String}`.
 struct WireReply<Payload: Decodable>: Decodable {
     let id: Int
@@ -179,6 +266,7 @@ final class MetricsBus: ObservableObject {
     /// Ring buffers. Sized for the panel's own history charts.
     static let historyLimit = 600
     static let requestLimit = 100
+    static let toolEventLimit = 200
 
     @Published var status: RunnerStatus = .idle
     @Published var phase: RunnerPhase = .idle
@@ -196,6 +284,11 @@ final class MetricsBus: ObservableObject {
     @Published var bridgeReady = false
     /// Text streamed for the most recent app-initiated request, newest last.
     @Published var streamText = ""
+    /// Tool calls and results for the most recent request, in order.
+    @Published var toolEvents: [ToolEvent] = []
+    /// Whether the model may call the read-only tools. Read by the store when it
+    /// sends a prompt, so both surfaces agree on the setting.
+    @Published var toolsEnabled = true
 
     /// Append a telemetry sample, keeping the buffer bounded.
     func ingest(_ sample: LiveMetrics) {
@@ -221,7 +314,18 @@ final class MetricsBus: ObservableObject {
         phase = RunnerPhase(rawValue: state.phase) ?? phase
     }
 
-    func clearStream() { streamText = "" }
+    /// Record a tool call or result, keeping the trace bounded.
+    func ingest(_ event: ToolEvent) {
+        toolEvents.append(event)
+        if toolEvents.count > Self.toolEventLimit {
+            toolEvents.removeFirst(toolEvents.count - Self.toolEventLimit)
+        }
+    }
+
+    func clearStream() {
+        streamText = ""
+        toolEvents = []
+    }
 }
 
 /// Panel tabs. `models` is the picker, `analytics` the expanded metrics surface.
@@ -235,7 +339,7 @@ enum PanelTab: String, CaseIterable, Identifiable {
 /// Commands the analytics surface may invoke, injected by the picker surface so
 /// the panel never depends on the transport or the store.
 struct AnalyticsActions {
-    var send: (String, Int) -> Void
+    var send: (String) -> Void
     var cancel: () -> Void
     /// Return to the model picker. The panel owns its tab state, so it supplies
     /// this; the analytics surface must never be a dead end.
@@ -258,7 +362,8 @@ struct RunnerConfig {
     var snapshotPath: String?
     var snapshotAnalytics: String?
     var model: String?
-    var tokens: Int
+    /// A token budget for a snapshot run; absent means no budget.
+    var tokens: Int?
     /// Overrides the built-in snapshot prompt, so the capture can exercise a
     /// particular shape of output (markdown, code, a long list).
     var prompt: String?
@@ -283,7 +388,7 @@ struct RunnerConfig {
         let tab = takeFlag("--tab").flatMap(PanelTab.init(rawValue:)) ?? .models
         let port = takeFlag("--port").flatMap(Int.init) ?? 8712
         let model = RunnerConfig.nonEmpty(takeFlag("--model"))
-        let tokens = takeFlag("--tokens").flatMap(Int.init) ?? 64
+        let tokens = takeFlag("--tokens").flatMap(Int.init)
         let requests = max(1, takeFlag("--requests").flatMap(Int.init) ?? 1)
         let prompt = RunnerConfig.nonEmpty(takeFlag("--prompt"))
         let loadForSnapshot = args.contains("--load")
