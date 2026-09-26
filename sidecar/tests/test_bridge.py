@@ -2227,6 +2227,12 @@ def test_tools_web_search_hits_the_real_endpoint() -> None:
 
 #: A query whose answer has to come from the real web.
 SEARCH_QUERY = "mlx lm apple silicon"
+#: A factual query Wikipedia answers directly, and the name the article it lists
+#: for it carries: `nvidia ceo` returns `Jensen Huang`, whose extract says so.
+WIKIPEDIA_QUERY = "nvidia ceo"
+WIKIPEDIA_NAME = "Jensen Huang"
+#: Every Wikipedia result URL is that article's own canonical address.
+WIKIPEDIA_PREFIX = "https://en.wikipedia.org/"
 #: The two lines one rendered result occupies: `1. A title`, then its own URL.
 _RESULT_TITLE_RE = re.compile(r"^\d+\. (\S.*)$", re.MULTILINE)
 _RESULT_URL_RE = re.compile(r"^   (https?://\S+)$", re.MULTILINE)
@@ -2292,6 +2298,43 @@ def test_web_search_answers_from_this_machine() -> None:
     print(f"web_search answered by {answered}: {detail[:300]}")
 
 
+def test_web_search_wikipedia_answers_a_factual_query(monkeypatch: Any) -> None:
+    """The last provider is a real factual source, exercised on its own.
+
+    Every other provider is dropped from the ladder, so the only endpoint this
+    test touches is Wikipedia: the MediaWiki search API for the hits, then each
+    hit's summary for a clean extract and the article's canonical URL. Wikipedia
+    being unreachable *here* is a skip; a reachable Wikipedia that cannot answer
+    `nvidia ceo` is a failure, because that is the provider this ladder ends on.
+    """
+    tools = _tools_module()
+    wikipedia = tuple(
+        provider for provider in tools.SEARCH_PROVIDERS if provider.name == "wikipedia"
+    )
+    assert len(wikipedia) == 1, tools.SEARCH_PROVIDERS
+    monkeypatch.setattr(tools, "SEARCH_PROVIDERS", wikipedia)
+
+    call = tools.ToolCall("web_search", {"query": WIKIPEDIA_QUERY, "max_results": 3})
+    result = tools.ToolRegistry().execute(call)
+    detail = result.detail or ""
+
+    if not result.ok:
+        reasons = re.findall(r"^- ([\w-]+): (.+)$", detail, re.MULTILINE)
+        assert reasons, (result.summary, detail)
+        if all(any(bad in reason for bad in _UNREACHABLE_REASONS) for _, reason in reasons):
+            _pytest().skip(f"Wikipedia is unreachable from this machine: {detail}")
+        _pytest().fail(f"Wikipedia produced no result for {WIKIPEDIA_QUERY!r}: {detail}")
+
+    assert detail.startswith("provider: wikipedia\n"), detail
+    urls = _RESULT_URL_RE.findall(detail)
+    assert urls, detail
+    assert all(url.startswith(WIKIPEDIA_PREFIX) for url in urls), detail
+    rendered = detail.partition("\n")[2]
+    assert WIKIPEDIA_NAME in rendered, detail
+    assert result.summary == f"{len(urls)} results", (result.summary, detail)
+    print(f"wikipedia: {detail[:300]}")
+
+
 def test_web_search_falls_through_a_page_with_no_results(monkeypatch: Any) -> None:
     """A 200 holding no result link is a fall-through, not the end of the search.
 
@@ -2299,7 +2342,9 @@ def test_web_search_falls_through_a_page_with_no_results(monkeypatch: Any) -> No
     (`duckduckgo.com/robots.txt`) and the rest at a closed local port. Both real
     reasons have to appear in the detail, and the walk has to reach the closed
     port at all, which is only possible if the empty 200 did not end the search
-    — the defect this ladder fixes.
+    — the defect this ladder fixes. The empty 200 is a challenge, so it is
+    retried the full number of times; the refused connections are hard failures
+    and get exactly one attempt; the detail reports both counts.
     """
     tools = _tools_module()
     first, *rest = tools.SEARCH_PROVIDERS
@@ -2330,6 +2375,18 @@ def test_web_search_falls_through_a_page_with_no_results(monkeypatch: Any) -> No
     assert len([line for line in detail.splitlines() if line.startswith("- ")]) == 1 + len(
         rest
     ), detail
+    # How many attempts each provider got, reported per provider: the challenge
+    # was retried, every hard failure was not.
+    retries = tools.CHALLENGE_RETRIES + 1
+    assert re.search(
+        rf"^- {re.escape(first.name)}: .* after {retries} attempts$", detail, re.MULTILINE
+    ), detail
+    for provider in rest:
+        assert re.search(
+            rf"^- {re.escape(provider.name)}: unreachable: .* after 1 attempt$",
+            detail,
+            re.MULTILINE,
+        ), detail
     assert not _RESULT_TITLE_RE.search(detail), detail
     assert not _RESULT_URL_RE.search(detail), detail
 
@@ -2360,6 +2417,42 @@ def test_web_search_names_every_provider_when_they_all_fail(monkeypatch: Any) ->
         assert f"- {provider.name}: unreachable: " in detail, detail
     assert not _RESULT_TITLE_RE.search(detail), detail
     assert not _RESULT_URL_RE.search(detail), detail
+
+
+def test_web_search_failure_text_forbids_answering_from_memory(
+    monkeypatch: Any,
+) -> None:
+    """A total failure tells the model not to answer from its own knowledge.
+
+    Every provider is pointed at a closed local port, so the ladder really
+    fails. The tool message the model reads is `model_text`, and it has to
+    carry the instruction that the lookup did not happen — the reason a
+    fabricated answer like a remembered CEO must not be given.
+    """
+    tools = _tools_module()
+    monkeypatch.setattr(
+        tools,
+        "SEARCH_PROVIDERS",
+        tuple(
+            dataclasses.replace(provider, template="http://127.0.0.1:1/search?{query}")
+            for provider in tools.SEARCH_PROVIDERS
+        ),
+    )
+
+    call = tools.ToolCall("web_search", {"query": "who is the ceo of nvidia"})
+    result = tools.ToolRegistry().execute(call)
+    text = result.model_text()
+
+    assert result.ok is False, result
+    assert result.summary == "every search provider failed", result
+    assert tools.SEARCH_FAILURE_INSTRUCTION in text, text
+    assert (
+        "could not look the answer up rather than answering from your own knowledge"
+        in text
+    ), text
+    # The instruction is the model's; the detail still carries no fake result.
+    assert not _RESULT_TITLE_RE.search(text), text
+    assert not _RESULT_URL_RE.search(text), text
 
 
 def test_tools_are_offered_through_the_chat_template() -> None:

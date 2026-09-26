@@ -14,9 +14,13 @@ a bad argument, a missing file, a network error and a timeout all come back as
 request still finishes.
 
 The only network traffic is one HTTPS GET per search provider, in the order of
-``SEARCH_PROVIDERS``, until one of them yields a parseable result; each page is
-parsed with ``html.parser`` — no dependencies beyond the standard library, and
-no API key on any provider.
+``SEARCH_PROVIDERS``, until one of them yields a parseable result. The HTML
+providers are parsed with ``html.parser``; the last one reads Wikipedia's JSON
+search API and then its article summaries — no dependencies beyond the standard
+library, and no API key on any provider. A provider that is merely *challenged*
+(a 202, a 429, or a 200 holding no usable results) is asked again a couple of
+times before the ladder moves on, because that refusal is per-IP and time-based;
+a hard failure — DNS, a refused connection, TLS, a timeout — moves on at once.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import html
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -60,6 +65,43 @@ SEARCH_TIMEOUT = 15.0
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+#: The headers every search request carries. DuckDuckGo's refusal does not
+#: depend on them — the same headers get 200 in one window and 202 in the next —
+#: but a real browser's User-Agent keeps the endpoints from refusing on sight.
+_SEARCH_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+#: A *challenge* is a transient refusal rather than a real failure: the two
+#: statuses the endpoints throttle with, and a 200 carrying no usable results.
+#: A challenged provider is asked this many extra times, pausing
+#: CHALLENGE_BACKOFF times the attempt number (about 0.5 s, then 1.0 s) between
+#: tries, because the refusal is per-IP and time-based and usually lifts.
+CHALLENGE_RETRIES = 2
+CHALLENGE_BACKOFF = 0.5
+CHALLENGE_STATUSES = (202, 429)
+#: The ceiling on one `web_search` call, retries included. A single request
+#: still gets SEARCH_TIMEOUT, but the ladder as a whole stops here so a run of
+#: slow endpoints cannot make one search take minutes.
+SEARCH_BUDGET = 40.0
+
+#: Wikipedia's summary endpoint: the clean extract and the canonical URL for one
+#: article title (underscored and percent-encoded).
+WIKIPEDIA_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+#: How much of that extract the model gets: a sentence or two, capped so one
+#: long sentence cannot paste an article into the context window.
+WIKIPEDIA_SNIPPET_SENTENCES = 2
+WIKIPEDIA_SNIPPET_CHARS = 400
+
+#: The sentence the model is handed when the whole ladder failed: the lookup did
+#: not happen, so the answer must not come from the model's own knowledge.
+SEARCH_FAILURE_INSTRUCTION = (
+    "No web search was available for this query, so say that you could not look "
+    "the answer up rather than answering from your own knowledge."
 )
 
 #: Both call spellings, matched over the whole text (never anchored to a line —
@@ -376,22 +418,29 @@ def _parse_results(page: str, parser_class: type[HTMLParser]) -> List[Dict[str, 
 
 @dataclass(frozen=True)
 class _SearchProvider:
-    """One keyless HTML search endpoint: its name, URL template and parser."""
+    """One keyless search endpoint: its name, URL template and host."""
 
     name: str
-    #: The endpoint, with `{query}` where the encoded query belongs.
+    #: The endpoint, with `{query}` where the encoded query belongs (and, for
+    #: Wikipedia, `{max_results}` for how many hits to ask for).
     template: str
-    #: The parser for this endpoint's own markup.
-    parser: type[HTMLParser]
+    #: The parser for this endpoint's own HTML markup; `None` for the JSON API,
+    #: which `kind` sends down a different path before any HTML is parsed.
+    parser: Optional[type[HTMLParser]]
     #: The endpoint's own host: links back to it are chrome, not results.
     host: str
+    #: How a response is read: "html" runs `parser` over the page, "wikipedia"
+    #: reads the MediaWiki search API and then each hit's article summary.
+    kind: str = "html"
 
 
 #: The provider ladder `web_search` walks in order. Every entry is a plain
-#: HTTPS GET to a keyless HTML endpoint, so there is no key to configure and no
-#: dependency to install. Order matters: DuckDuckGo answers a machine it has
-#: rate limited with HTTP 202 and a page holding no result links, and that is
-#: not an answer — the next provider is asked instead.
+#: keyless HTTPS endpoint, so there is no key to configure and no dependency to
+#: install. Order matters: DuckDuckGo answers a machine it has rate limited with
+#: HTTP 202, and that is not an answer — the next provider is asked (after a
+#: retry, if the refusal looks transient). Wikipedia is last and answers a
+#: different question: it is a factual lookup source, not a general web index,
+#: so a general query reaches it only when every search engine has refused.
 SEARCH_PROVIDERS: Tuple[_SearchProvider, ...] = (
     _SearchProvider(
         "duckduckgo",
@@ -411,85 +460,243 @@ SEARCH_PROVIDERS: Tuple[_SearchProvider, ...] = (
         _BraveParser,
         "search.brave.com",
     ),
+    _SearchProvider(
+        "wikipedia",
+        "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json"
+        "&srsearch={query}&srlimit={max_results}",
+        None,
+        "en.wikipedia.org",
+        "wikipedia",
+    ),
 )
 
 
-def _ask_provider(
-    provider: _SearchProvider, query: str
-) -> Tuple[List[Dict[str, str]], str]:
-    """One provider's results, and the real reason it produced none.
+@dataclass(frozen=True)
+class _Attempt:
+    """One request's outcome: the results, the real reason for none, and whether
+    that reason is a transient challenge the ladder should retry.
 
     The reason is empty exactly when there is at least one result, and it is
-    always what actually happened — an HTTP status, the socket's own error, or
-    a page that parsed to nothing. It is never a guess.
+    always what actually happened — an HTTP status, the socket's own error, or a
+    200 that carried nothing usable. It is never a guess.
     """
-    url = provider.template.format(query=urllib.parse.urlencode({"q": query}))
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
+
+    results: List[Dict[str, str]]
+    reason: str
+    challenged: bool
+
+
+def _http_get(url: str) -> Tuple[int, str, str]:
+    """One real HTTPS GET: its status, its reason phrase and its decoded body.
+
+    A transport failure — DNS, a refused connection, TLS, a timeout — is raised
+    as-is, for the caller to name. A non-2xx status is returned rather than
+    raised, so a challenge (202/429) can be told from a hard failure.
+    """
+    request = urllib.request.Request(url, headers=_SEARCH_HEADERS)
     try:
         with urllib.request.urlopen(request, timeout=SEARCH_TIMEOUT) as response:
             status = int(getattr(response, "status", 0) or 0)
+            reason = str(getattr(response, "reason", "") or "")
             charset = response.headers.get_content_charset() or "utf-8"
-            page = response.read().decode(charset, "replace")
+            return status, reason, response.read().decode(charset, "replace")
     except urllib.error.HTTPError as exc:
-        return [], f"HTTP {exc.code} {exc.reason}".strip()
-    except urllib.error.URLError as exc:
-        return [], f"unreachable: {exc.reason}"
-    except TimeoutError:
-        return [], f"timed out after {SEARCH_TIMEOUT:g}s"
-    except OSError as exc:
-        return [], f"{exc.__class__.__name__}: {exc}"
+        charset = exc.headers.get_content_charset() if exc.headers else None
+        body = exc.read().decode(charset or "utf-8", "replace")
+        return int(exc.code), str(exc.reason or ""), body
 
+
+def _transport_reason(exc: BaseException) -> str:
+    """The real reason a request never produced a response."""
+    if isinstance(exc, urllib.error.URLError):
+        return f"unreachable: {exc.reason}"
+    if isinstance(exc, TimeoutError):
+        return f"timed out after {SEARCH_TIMEOUT:g}s"
+    return f"{exc.__class__.__name__}: {exc}"
+
+
+def _status_reason(status: int, reason: str) -> str:
+    """``HTTP <status> <phrase> (the endpoint did not serve a results page)``."""
+    phrase = f" {reason.strip()}" if reason.strip() else ""
+    return f"HTTP {status}{phrase} (the endpoint did not serve a results page)"
+
+
+def _first_sentences(text: str) -> str:
+    """A Wikipedia extract's first sentence or two, collapsed and capped."""
+    collapsed = " ".join(text.split())
+    sentences = re.split(r"(?<=[.!?])\s+", collapsed)
+    snippet = " ".join(sentences[:WIKIPEDIA_SNIPPET_SENTENCES]).strip()
+    if len(snippet) <= WIKIPEDIA_SNIPPET_CHARS:
+        return snippet
+    cut = snippet[:WIKIPEDIA_SNIPPET_CHARS]
+    head, _, _tail = cut.rpartition(" ")
+    return (head or cut).rstrip(" ,;:") + "…"
+
+
+def _wikipedia_summary(title: Any) -> Optional[Dict[str, str]]:
+    """One article's `{title, url, snippet}`, or `None` when its summary is unusable.
+
+    The URL is the summary's own canonical `content_urls.desktop.page`, so it is
+    the article address Wikipedia itself publishes, never one this module built.
+    """
+    if not isinstance(title, str) or not title.strip():
+        return None
+    slug = urllib.parse.quote(title.strip().replace(" ", "_"))
+    try:
+        status, _reason, body = _http_get(WIKIPEDIA_SUMMARY_URL.format(title=slug))
+    except OSError:
+        return None
     if status != 200:
-        return [], f"HTTP {status} (the endpoint did not serve a results page)"
+        return None
+    try:
+        summary = json.loads(body)
+        extract = summary["extract"]
+        page = summary["content_urls"]["desktop"]["page"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(extract, str) or not extract.strip():
+        return None
+    if not isinstance(page, str) or not page:
+        return None
+    name = summary.get("title")
+    return {
+        "title": name if isinstance(name, str) and name else title,
+        "url": page,
+        "snippet": _first_sentences(extract),
+    }
+
+
+def _ask_wikipedia(
+    provider: _SearchProvider, query: str, max_results: int
+) -> _Attempt:
+    """The MediaWiki search API's hits, each with its article's own summary."""
+    url = provider.template.format(
+        query=urllib.parse.quote_plus(query), max_results=max_results
+    )
+    try:
+        status, reason, body = _http_get(url)
+    except OSError as exc:
+        return _Attempt([], _transport_reason(exc), False)
+    if status != 200:
+        return _Attempt([], _status_reason(status, reason), status in CHALLENGE_STATUSES)
+    try:
+        hits = json.loads(body)["query"]["search"]
+        if not isinstance(hits, list):
+            raise TypeError("`search` is not a list")
+    except (ValueError, KeyError, TypeError):
+        return _Attempt(
+            [], "HTTP 200 but the response was not the search API's JSON", True
+        )
+    if not hits:
+        # The API answered: no article matched. That is a real empty, not a
+        # refusal, so the ladder moves on without retrying it.
+        return _Attempt([], "no Wikipedia article matched the query", False)
+    results: List[Dict[str, str]] = []
+    for hit in hits:
+        article = _wikipedia_summary(hit.get("title") if isinstance(hit, dict) else None)
+        if article is not None:
+            results.append(article)
+            if len(results) >= max_results:
+                break
+    if not results:
+        return _Attempt([], "HTTP 200 but no Wikipedia summary could be read", True)
+    return _Attempt(results, "", False)
+
+
+def _ask_html(provider: _SearchProvider, query: str) -> _Attempt:
+    """One keyless HTML endpoint's real results, or the reason it gave none."""
+    url = provider.template.format(query=urllib.parse.urlencode({"q": query}))
+    try:
+        status, reason, page = _http_get(url)
+    except OSError as exc:
+        return _Attempt([], _transport_reason(exc), False)
+    if status != 200:
+        return _Attempt([], _status_reason(status, reason), status in CHALLENGE_STATUSES)
+    parser = provider.parser
+    assert parser is not None, f"{provider.name} is an HTML provider without a parser"
     results = [
         result
-        for result in _parse_results(page, provider.parser)
+        for result in _parse_results(page, parser)
         if _is_external(result["url"], provider.host)
     ]
     if not results:
-        return [], (
+        return _Attempt(
+            [],
             "HTTP 200 but the page held no result link (the endpoint may be "
-            "rate limiting)"
+            "rate limiting)",
+            True,
         )
-    return results, ""
+    return _Attempt(results, "", False)
+
+
+def _ask_provider(
+    provider: _SearchProvider, query: str, max_results: int
+) -> _Attempt:
+    """One attempt at one provider, dispatched by how its endpoint answers."""
+    if provider.kind == "wikipedia":
+        return _ask_wikipedia(provider, query, max_results)
+    return _ask_html(provider, query)
+
+
+def _rendered_results(provider: _SearchProvider, results: List[Dict[str, str]]) -> str:
+    """One provider's answer in the shape the model reads."""
+    return "\n".join(
+        [f"provider: {provider.name}"]
+        + [
+            f"{index}. {result['title']}\n   {result['url']}"
+            + (f"\n   {result['snippet']}" if result["snippet"] else "")
+            for index, result in enumerate(results, start=1)
+        ]
+    )
 
 
 def _search(query: str, max_results: int) -> ToolResult:
     """Walk the provider ladder; the first real result answers.
 
-    Every provider failure is real and is kept, so when the whole ladder fails
-    the model is told which provider said what — an HTTP 202 and a timeout read
-    differently, and neither is reported as an empty success.
+    A challenged provider — a 202, a 429, or a 200 with nothing usable — is
+    asked again up to CHALLENGE_RETRIES more times, with a short pause between
+    tries, because that refusal is per-IP and time-based and usually lifts; a
+    hard failure moves on at once. Every reason recorded is real and the
+    attempts each provider got are reported, so when the whole ladder fails the
+    model is told which provider said what, is never handed an empty success,
+    and is told not to answer from its own knowledge instead.
     """
+    started = time.monotonic()
     failures: List[str] = []
     for provider in SEARCH_PROVIDERS:
-        results, reason = _ask_provider(provider, query)
-        if results:
-            results = results[:max_results]
-            detail = "\n".join(
-                [f"provider: {provider.name}"]
-                + [
-                    f"{index}. {result['title']}\n   {result['url']}"
-                    + (f"\n   {result['snippet']}" if result["snippet"] else "")
-                    for index, result in enumerate(results, start=1)
-                ]
+        if time.monotonic() - started >= SEARCH_BUDGET:
+            failures.append(
+                f"{provider.name}: not attempted (the {SEARCH_BUDGET:g}s search "
+                "budget was already spent)"
             )
-            return ToolResult(True, f"{len(results)} results", detail=detail)
-        failures.append(f"{provider.name}: {reason}")
+            continue
+        attempts = 0
+        while True:
+            attempts += 1
+            attempt = _ask_provider(provider, query, max_results)
+            if not attempt.challenged or attempts > CHALLENGE_RETRIES:
+                break
+            pause = CHALLENGE_BACKOFF * attempts
+            if time.monotonic() - started + pause >= SEARCH_BUDGET:
+                break
+            time.sleep(pause)
+        if attempt.results:
+            results = attempt.results[:max_results]
+            return ToolResult(
+                True,
+                f"{len(results)} results",
+                detail=_rendered_results(provider, results),
+            )
+        word = "attempt" if attempts == 1 else "attempts"
+        failures.append(f"{provider.name}: {attempt.reason} after {attempts} {word}")
 
     return ToolResult(
         False,
         "every search provider failed",
-        detail=(
-            f"web_search: no provider returned a result for {query!r}:\n"
-            + "\n".join(f"- {failure}" for failure in failures)
+        detail="\n".join(
+            [f"web_search: no provider returned a result for {query!r}:"]
+            + [f"- {failure}" for failure in failures]
+            + ["", SEARCH_FAILURE_INSTRUCTION]
         ),
     )
 
@@ -515,7 +722,10 @@ TOOL_SPECS: Tuple[_Spec, ...] = (
     _Spec(
         "web_search",
         "web_search(query: string, max_results: integer = 5) -> {results: [{title, url, snippet}]}",
-        "Search the web. Use it for facts you cannot read from a file.",
+        "Search the web. Use it for facts you cannot read from a file. The last "
+        "provider is Wikipedia, a factual lookup source rather than a general "
+        "web index: reach for it for a person, place or thing, not for "
+        "site:-style or news queries.",
         {
             "query": {"type": "string", "description": "The search query."},
             "max_results": {
